@@ -257,10 +257,10 @@ async def reconcile_pending_melts(funding_source: LightningBackendConfig) -> Non
 def _created_invoice_payment_hash(pr: str) -> str:
     """The payment hash of an invoice this mint just created, read off
     the invoice itself - only reached for backends that cannot know the
-    preimage at creation time (spark, whose SSP generates it; see
-    node.create_invoice). A BOLT11 invoice always commits to exactly one
-    payment hash, so a decode failure or a hashless invoice here is a
-    malformed backend response, logged rather than trusted."""
+    preimage at creation time (spark and phoenixd, which generate it
+    themselves; see node.create_invoice). A BOLT11 invoice always commits
+    to exactly one payment hash, so a decode failure or a hashless invoice
+    here is a malformed backend response, logged rather than trusted."""
     try:
         decoded = bolt11.decode(pr)
     except Exception as exc:
@@ -524,9 +524,9 @@ def _melt_fee_limit_msat(amount_msat: int) -> int:
 
 def _zaps_offered() -> bool:
     """NIP-57 zaps need a Nostr key to sign receipts with and a funding
-    source that can bind an invoice to a description hash - lnd and cln
-    can, spark cannot (see spark._create_invoice_spark)."""
-    return settings.nostr_key is not None and settings.funding_source().backend in ("lnd", "cln")
+    source that can bind an invoice to a description hash - lnd, cln and
+    phoenixd can, spark cannot (see spark._create_invoice_spark)."""
+    return settings.nostr_key is not None and settings.funding_source().backend in ("lnd", "cln", "phoenixd")
 
 
 # An unpaid zap invoice is polled for settlement this long after it was
@@ -873,11 +873,16 @@ async def _mint_address_response(req: Request, username: str) -> LnurlMintAddres
             # its dedicated seed-derived LUD-25 key rather than the node
             # identity: that's the key its notes are actually signed with
             # (see spark._lud25_signing_key), and it derives purely locally,
-            # so it costs no extra network round trip either
+            # so it costs no extra network round trip either. phoenixd
+            # likewise signs with its configured key, never its node id
             if funding_source.backend == "spark":
                 from .spark import signing_pubkey_hex
 
                 mint_pubkey_value = signing_pubkey_hex(funding_source)
+            elif funding_source.backend == "phoenixd":
+                from .phoenixd import signing_pubkey_hex as phoenixd_signing_pubkey_hex
+
+                mint_pubkey_value = phoenixd_signing_pubkey_hex(funding_source)
             else:
                 mint_pubkey_value = info.uri.split("@")[0] if info.uri else None
         except Exception as exc:
@@ -1022,15 +1027,16 @@ async def _pay_callback(
         # never handed back on the wire - see log_internal_error
         raise HTTPException(HTTPStatus.INTERNAL_SERVER_ERROR, log_internal_error("Error creating invoice", exc))
     # lnd/cln generate the preimage themselves and return it, so the hash
-    # is sha256(preimage); the spark backend cannot - its SSP generates
-    # and holds the preimage (see spark.py's module docstring) - and
-    # returns None instead, so there the hash is read straight off the
-    # invoice itself. The preimage never becomes a note's spend now
-    # that comment protection is mandatory, and is discarded here, per
-    # the spec's storing-hashes-not-secrets guidance - only the payment
-    # hash and the invoice itself (for LUD-21 verify) are stored. The
-    # invoice itself is for the full `amount` (what the payer actually
-    # pays); the note it produces is credited net of the mint fee.
+    # is sha256(preimage); the spark and phoenixd backends cannot - the
+    # SSP/node generates and holds the preimage (see spark.py's and
+    # phoenixd.py's module docstrings) - and return None instead, so there
+    # the hash is read straight off the invoice itself. The preimage never
+    # becomes a note's spend now that comment protection is mandatory, and
+    # is discarded here, per the spec's storing-hashes-not-secrets
+    # guidance - only the payment hash and the invoice itself (for LUD-21
+    # verify) are stored. The invoice itself is for the full `amount`
+    # (what the payer actually pays); the note it produces is credited net
+    # of the mint fee.
     payment_hash = sha256(preimage).hexdigest() if preimage is not None else _created_invoice_payment_hash(pr)
     try:
         notes.create_mint(

@@ -28,9 +28,9 @@ class Settings(BaseSettings):
     # verification via the node's own signmessage RPC (see signing.py) -
     # there's no separate setting for that, it's simply unavailable without
     # a funding source. Only the credential for the chosen backend is
-    # required (macaroon for lnd, rune for cln, mnemonic for spark); the
-    # others are ignored.
-    fundingsource_backend: Literal["lnd", "cln", "spark"] | None = None
+    # required (macaroon for lnd, rune for cln, mnemonic for spark,
+    # password and signing key for phoenixd); the others are ignored.
+    fundingsource_backend: Literal["lnd", "cln", "spark", "phoenixd"] | None = None
     fundingsource_url: str | None = None
     fundingsource_macaroon: SecretStr | None = None
     fundingsource_rune: SecretStr | None = None
@@ -57,6 +57,21 @@ class Settings(BaseSettings):
     fundingsource_spark_storage_dir: str | None = None
     fundingsource_spark_sync_interval_secs: int = Field(default=15, ge=1)
     fundingsource_spark_account_number: int | None = None
+
+    # phoenixd (FUNDINGSOURCE_BACKEND=phoenixd, see lnurl_mint/phoenixd.py):
+    # ACINQ's phoenixd, over its HTTP API. The url must be loopback
+    # (phoenixd's default http://127.0.0.1:9740) unless allow_remote is on
+    # AND it is https. The password is phoenix.conf's FULL-ACCESS
+    # http-password - melting calls /payinvoice, which the limited-access
+    # one cannot - and can spend the node's whole balance. The signing key
+    # (32 bytes of hex) is this mint's own LUD-25 note-signing key, since
+    # phoenixd has no signmessage: wallets pin the mintPubkey it yields, so
+    # it must never change - back it up together with DATABASE_PATH.
+    fundingsource_phoenixd_url: str | None = None
+    fundingsource_phoenixd_password: SecretStr | None = None
+    fundingsource_phoenixd_allow_remote: bool = False
+    fundingsource_phoenixd_signing_key: SecretStr | None = None
+
     # how often (seconds) to re-probe the funding source in the background
     # after boot, once a backend is configured - the one-shot check at
     # startup (see server.py's lifespan) only catches a connection problem
@@ -234,6 +249,44 @@ class Settings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _phoenixd_is_safely_configured(self) -> "Settings":
+        """With FUNDINGSOURCE_BACKEND=phoenixd, everything phoenixd.py relies
+        on is checked at startup rather than at a wallet's first request: a
+        url the full-access password may travel to, the password itself, a
+        valid signing key (without it every note would go out unsigned),
+        whole-sat bounds (phoenixd invoices whole sats only - minSendable
+        is walked up from MIN_MINT_MSAT too, see router._min_sendable_msat),
+        and a mint fee covering phoenixd's own fee for paying a melt out -
+        the router sizes every melt's fee budget from the mint fee (see
+        router._melt_fee_limit_msat), and phoenixd.pay_invoice refuses a
+        melt that budget cannot pay for."""
+        if self.fundingsource_backend != "phoenixd":
+            return self
+        from .phoenixd import TRAMPOLINE_FEE_BASE_MSAT, TRAMPOLINE_FEE_PPM, checked_url, parse_signing_key
+
+        if not self.fundingsource_phoenixd_url:
+            raise ValueError("FUNDINGSOURCE_PHOENIXD_URL is required with FUNDINGSOURCE_BACKEND=phoenixd.")
+        checked_url(self.fundingsource_phoenixd_url, self.fundingsource_phoenixd_allow_remote)
+        if not self.fundingsource_phoenixd_password or not self.fundingsource_phoenixd_password.get_secret_value():
+            raise ValueError(
+                "FUNDINGSOURCE_PHOENIXD_PASSWORD is required with FUNDINGSOURCE_BACKEND=phoenixd "
+                "(phoenix.conf's full-access http-password)."
+            )
+        if not self.fundingsource_phoenixd_signing_key:
+            raise ValueError("FUNDINGSOURCE_PHOENIXD_SIGNING_KEY is required with FUNDINGSOURCE_BACKEND=phoenixd.")
+        parse_signing_key(self.fundingsource_phoenixd_signing_key.get_secret_value())
+        for name in ("min_sendable_msat", "max_sendable_msat", "min_mint_msat"):
+            if getattr(self, name) % 1000:
+                raise ValueError(f"{name.upper()} must be a whole number of sats: phoenixd invoices whole sats only.")
+        if self.base_fee_msat < TRAMPOLINE_FEE_BASE_MSAT or self.fee_percent_ppm < TRAMPOLINE_FEE_PPM:
+            raise ValueError(
+                f"The mint fee must cover what phoenixd pays to melt a note ({TRAMPOLINE_FEE_BASE_MSAT} msat + "
+                f"{TRAMPOLINE_FEE_PPM} ppm): set BASE_FEE_MSAT >= {TRAMPOLINE_FEE_BASE_MSAT} and "
+                f"FEE_PERCENT_PPM >= {TRAMPOLINE_FEE_PPM}."
+            )
+        return self
+
     @field_validator("nostr_key")
     @classmethod
     def _nostr_key_is_32_bytes_of_hex(cls, value: SecretStr | None) -> SecretStr | None:
@@ -291,6 +344,10 @@ class Settings(BaseSettings):
             or os.path.join(os.path.dirname(os.path.abspath(self.database_path)), "spark-wallet"),
             spark_sync_interval_secs=self.fundingsource_spark_sync_interval_secs,
             spark_account_number=self.fundingsource_spark_account_number,
+            phoenixd_url=self.fundingsource_phoenixd_url,
+            phoenixd_password=self.fundingsource_phoenixd_password,
+            phoenixd_allow_remote=self.fundingsource_phoenixd_allow_remote,
+            phoenixd_signing_key=self.fundingsource_phoenixd_signing_key,
         )
 
 

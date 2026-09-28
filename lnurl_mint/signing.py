@@ -19,8 +19,10 @@ from .node import LightningBackendConfig, fetch_node_info, sign_message
 # same call"), and a spark wallet's invoices are signed by its SSP anyway;
 # a wallet verifies a note by recovering the key from (digest, sig) and
 # comparing it to the advertised mintPubkey, which holds for any secp256k1
-# key - the spec-digest and wire format below are identical for all three
-# backends, only the key differs.
+# key - the spec-digest and wire format below are identical for every
+# backend, only the key differs. phoenixd has no signmessage either, so it
+# signs the same way with a dedicated key the operator configures
+# (FUNDINGSOURCE_PHOENIXD_SIGNING_KEY, see phoenixd._sign_message_phoenixd).
 _LIGHTNING_SIGNED_MESSAGE_PREFIX = b"Lightning Signed Message:"
 _DOMAIN_TAG = "LNURLcash"
 
@@ -51,18 +53,23 @@ async def mint_pubkey(config: LightningBackendConfig) -> str | None:
     the funding source node's own identity pubkey for lnd/cln (the same
     key it signs BOLT-11 invoices with, so freshly minted and rotated
     notes verify against the same identity, exactly as the spec
-    recommends), and for spark the dedicated seed-derived signing key its
+    recommends), for spark the dedicated seed-derived signing key its
     notes are signed with (see spark._lud25_signing_key - a purely local
-    derivation, no network round trip). None if no funding source is
-    configured or it's unreachable - offline verification is then simply
-    unavailable, the same way funding-source-backed features are when
-    that's unconfigured."""
+    derivation, no network round trip), and for phoenixd the configured
+    signing key's (see phoenixd.signing_pubkey_hex, local too). None if no
+    funding source is configured or it's unreachable - offline
+    verification is then simply unavailable, the same way
+    funding-source-backed features are when that's unconfigured."""
     if not config.backend:
         return None
     if config.backend == "spark":
         from .spark import signing_pubkey_hex
 
         return signing_pubkey_hex(config)
+    if config.backend == "phoenixd":
+        from .phoenixd import signing_pubkey_hex as phoenixd_signing_pubkey_hex
+
+        return phoenixd_signing_pubkey_hex(config)
     try:
         info = await fetch_node_info(config)
     except Exception as exc:

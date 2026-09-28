@@ -58,7 +58,7 @@ class LightningBackendConfig(BaseModel):
     once by the operator - see config.Settings.funding_source). Only the
     field(s) relevant to `backend` are ever read."""
 
-    backend: Literal["lnd", "cln", "spark"] | None = None
+    backend: Literal["lnd", "cln", "spark", "phoenixd"] | None = None
     url: str | None = None
     macaroon: SecretStr | None = None  # lnd
     rune: SecretStr | None = None  # cln
@@ -73,6 +73,15 @@ class LightningBackendConfig(BaseModel):
     spark_storage_dir: str | None = None
     spark_sync_interval_secs: int = 15
     spark_account_number: int | None = None
+    # phoenixd (see phoenixd.py - ACINQ's headless Phoenix over its HTTP
+    # API): where it listens, its FULL-ACCESS http-password (a melt calls
+    # /payinvoice, which the limited-access one cannot), whether a
+    # non-loopback url is deliberately allowed, and the mint's own LUD-25
+    # note-signing key - phoenixd has no signmessage to sign with instead
+    phoenixd_url: str | None = None
+    phoenixd_password: SecretStr | None = None
+    phoenixd_allow_remote: bool = False
+    phoenixd_signing_key: SecretStr | None = None
 
     @property
     def verify(self) -> bool | ssl.SSLContext:
@@ -103,11 +112,17 @@ async def _dispatch(
     in the process-wide SDK singleton spark.py builds from config - so
     its branch dispatches by operation name to `fn(*leading, config,
     *trailing)` instead (imported lazily: spark.py imports this module's
-    shared types, so a module-level import would be circular)."""
+    shared types, so a module-level import would be circular). phoenixd
+    dispatches the same way: its url comes with safety checks of its own
+    and its signing key is local, neither of which fits the pair."""
     if config.backend == "spark":
         from .spark import dispatch as spark_dispatch
 
         return await spark_dispatch(operation, config, leading, trailing)
+    if config.backend == "phoenixd":
+        from .phoenixd import dispatch as phoenixd_dispatch
+
+        return await phoenixd_dispatch(operation, config, leading, trailing)
     if config.backend == "lnd":
         if not config.url or not config.macaroon:
             raise ValueError("Macaroon is required.")
@@ -125,17 +140,17 @@ async def create_invoice(
     memo: str = "lnurlcash mint",
     description_for_hash: str | None = None,
 ) -> tuple[str, bytes | None]:
-    """The preimage half of the result is None for the spark backend -
-    its SSP generates and holds the preimage itself (see spark.py's
-    module docstring), so there the caller takes the payment hash off
-    the returned invoice instead of sha256(preimage); lnd/cln both let
-    the caller supply the preimage, so those return it and nothing else
-    ever needs to.
+    """The preimage half of the result is None for the spark and phoenixd
+    backends - their SSP/node generates and holds the preimage itself
+    (see spark.py's and phoenixd.py's module docstrings), so there the
+    caller takes the payment hash off the returned invoice instead of
+    sha256(preimage); lnd/cln both let the caller supply the preimage, so
+    those return it and nothing else ever needs to.
 
     `description_for_hash` commits the invoice to a text it does not
     carry: the invoice gets `h` = sha256(text) in place of `d`, which is
-    how a NIP-57 zap invoice binds to its zap request. lnd and cln both
-    do it; spark cannot (see _create_invoice_spark)."""
+    how a NIP-57 zap invoice binds to its zap request. lnd, cln and
+    phoenixd do it; spark cannot (see _create_invoice_spark)."""
     return await _dispatch(
         "create_invoice",
         config,

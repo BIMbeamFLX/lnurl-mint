@@ -148,7 +148,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
         # later, or breaking again after a boot-time success (see issue #2)
         monitor_task = asyncio.create_task(_monitor_funding_source(funding_source, healthy))
         if settings.nostr_key is not None:
-            if funding_source.backend in ("lnd", "cln"):
+            if funding_source.backend in ("lnd", "cln", "phoenixd"):
                 logging.info(f"NIP-57 zaps on: receipts signed as {settings.nostr_pubkey()}.")
                 zap_task = asyncio.create_task(_publish_zap_receipts_forever(funding_source))
             else:
