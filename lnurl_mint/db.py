@@ -715,5 +715,32 @@ class NoteStore:
             self.conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('mint_pubkey', ?)", (pubkey,))
             return self.conn.execute("SELECT value FROM meta WHERE key = 'mint_pubkey'").fetchone()[0]
 
+    def fee_credit_baseline(self) -> int | None:
+        """phoenixd's fee credit, in sat, as recorded once its auto-liquidity
+        was switched off (see phoenixd._fee_credit_problem) - None if it
+        never was."""
+        row = self.conn.execute("SELECT value FROM meta WHERE key = 'phoenixd_fee_credit_baseline_sat'").fetchone()
+        return int(row[0]) if row else None
+
+    def record_fee_credit_baseline(self, fee_credit_sat: int) -> None:
+        """Sets that baseline outright - the operator's step
+        (python -m lnurl_mint.phoenixd record-fee-credit-baseline)."""
+        with self._lock, self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('phoenixd_fee_credit_baseline_sat', ?)",
+                (str(fee_credit_sat),),
+            )
+
+    def lower_fee_credit_baseline(self, fee_credit_sat: int) -> None:
+        """Lowers a recorded baseline to `fee_credit_sat`, never raises it:
+        phoenixd's fee credit only shrinks by paying for liquidity, and any
+        growth past its lowest point is credit a note may now stand on."""
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE meta SET value = ?"
+                " WHERE key = 'phoenixd_fee_credit_baseline_sat' AND CAST(value AS INTEGER) > ?",
+                (str(fee_credit_sat), fee_credit_sat),
+            )
+
 
 notes = NoteStore(settings.database_path)

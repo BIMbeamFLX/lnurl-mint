@@ -14,8 +14,12 @@ endpoints:
 - is_payment_complete / payment_preimage
                       -> GET /payments/outgoingbyhash/{paymentHash}
 - fetch_node_info     -> GET /getinfo (plus a password-scope probe and
-                         GET /getbalance's fee credit)
+                         GET /getbalance's fee credit, both only warned
+                         about - see _report_degraded)
 - sign_message        -> signed locally (LUD-25 digest, configured key)
+
+`python -m lnurl_mint.phoenixd record-fee-credit-baseline` records the fee
+credit baseline (see below) - the operator's step once auto-liquidity is off.
 
 Authentication is HTTP Basic with an empty username. phoenix.conf holds
 two passwords, and this backend needs the full-access `http-password`:
@@ -59,8 +63,13 @@ real one. So the operator must run phoenixd with auto-liquidity=off and
 max-fee-credit=off once inbound liquidity is bought (payments that do not
 fit the channel are then refused outright, instead of landing in fee
 credit or arriving short by a liquidity fee), and as a backstop
-create_invoice and the health check refuse while GET /getbalance reports
-any fee credit at all.
+create_invoice refuses while GET /getbalance reports more fee credit than
+the baseline recorded at that switch (none recorded: any). Not against
+zero: a liquidity purchase only spends credit up to its actual fee, while
+credit builds up to the worst case (lightning-kmp InteractiveTx.kt,
+IncomingPaymentHandler.kt), so some is likely left over for good. Credit
+that shrinks lowers the baseline with it, so any later growth counts. The
+health check only warns about it - melts, and reconciling them, carry on.
 
 **The melt fee is phoenixd's fixed rule, not a cap we pass.** /payinvoice
 takes no fee limit: every payment goes through ACINQ's trampoline, which
@@ -137,6 +146,10 @@ EXTERNAL_ID_PREFIX = "lnurlcash:"
 
 # phoenixd refuses a longer invoice description (Api.kt, createinvoice)
 _MAX_DESCRIPTION_LENGTH = 128
+# how long a mint invoice stays payable - phoenixd's own default is a day
+# (lightning-kmp's bolt11InvoiceExpiry), which is also how long an operator
+# would have to wait for old invoices to expire before a liquidity purchase
+_INVOICE_EXPIRY_SECONDS = 60 * 60
 # every phoenixd answer is a small JSON document - anything bigger is not one
 _MAX_RESPONSE_BYTES = 1 << 20
 _TIMEOUT_SECONDS = 15.0
@@ -156,6 +169,9 @@ _GONE_CHANNEL_STATES = {"Closing", "Closed", "Aborted"}
 _FEE_RULE_CHECKED_VERSIONS = ((0, 5, 1), (0, 9, 1))
 # phoenixd versions (getinfo's "0.9.1-<commit>") already logged by this process
 _logged_versions: set[str] = set()
+# what the last health check found wrong, per part of the mint (see
+# _report_degraded) - so a problem is logged when it appears or changes
+_degraded: dict[str, str | None] = {}
 
 
 def trampoline_fee_msat(amount_msat: int) -> int:
@@ -328,21 +344,67 @@ def _external_id(config: LightningBackendConfig) -> str:
     return f"{EXTERNAL_ID_PREFIX}{signing_pubkey_hex(config)}"
 
 
-async def _refuse_fee_credit(config: LightningBackendConfig) -> None:
-    """Raises while GET /getbalance reports any fee credit: sats phoenixd can
-    only spend on its own liquidity fees, which a note minted for them would
-    stand on - see the module docstring."""
+async def _fee_credit_sat(config: LightningBackendConfig) -> int:
+    """phoenixd's fee credit right now (GET /getbalance), in sat."""
     status, body = await _call(config, "GET", "/getbalance")
     _require_ok(status, body, "getbalance")
     fee_credit_sat = _json_object(body, "getbalance").get("feeCreditSat")
     if not isinstance(fee_credit_sat, int):
         raise ValueError("phoenixd did not report its fee credit.")
-    if fee_credit_sat > 0:
-        raise ValueError(
-            f"phoenixd holds {fee_credit_sat} sat of fee credit, which no melt can spend - minting stays off "
-            "while any remains. Run phoenixd with auto-liquidity=off and max-fee-credit=off once inbound "
-            "liquidity is bought (only a liquidity purchase uses fee credit up)."
+    return fee_credit_sat
+
+
+async def _fee_credit_problem(config: LightningBackendConfig) -> str | None:
+    """Why minting must stop for phoenixd's fee credit - sats it can only
+    spend on its own liquidity fees, which a note minted for them would
+    stand on - or None. Measured against the baseline recorded once
+    auto-liquidity was switched off (see the module docstring), lowered to
+    any smaller credit seen since; with none recorded, against zero."""
+    fee_credit_sat = await _fee_credit_sat(config)
+    # imported here, not at the top: db needs config's settings, and
+    # config's own validation is what first imports this module
+    from .db import notes
+
+    baseline = notes.fee_credit_baseline()
+    if baseline is not None and fee_credit_sat < baseline:
+        notes.lower_fee_credit_baseline(fee_credit_sat)
+        baseline = fee_credit_sat
+    if fee_credit_sat <= (baseline if baseline is not None else 0):
+        return None
+    if baseline is None:
+        return (
+            f"phoenixd holds {fee_credit_sat} sat of fee credit, which no melt can spend, and no baseline is "
+            "recorded - minting stays off. Run phoenixd with auto-liquidity=off and max-fee-credit=off, then "
+            "record the baseline: python -m lnurl_mint.phoenixd record-fee-credit-baseline."
         )
+    return (
+        f"phoenixd's fee credit rose to {fee_credit_sat} sat, above its {baseline} sat baseline - a payment "
+        "landed in fee credit, which no melt can spend, so minting stays off. Check that phoenixd runs with "
+        "auto-liquidity=off and max-fee-credit=off."
+    )
+
+
+def _report_degraded(part: str, problem: str | None) -> None:
+    """Logs a problem that leaves phoenixd reachable but one part of this
+    mint unusable - when it appears or changes, and once when it clears,
+    never on every health check."""
+    previous = _degraded.get(part)
+    _degraded[part] = problem
+    if problem is not None and problem != previous:
+        logging.warning("%s", problem)
+    elif problem is None and previous is not None:
+        logging.info("phoenixd: %s works again.", part)
+
+
+async def record_fee_credit_baseline(config: LightningBackendConfig) -> int:
+    """Records phoenixd's fee credit right now as the baseline minting is
+    measured against (see _fee_credit_problem), and returns it - the
+    operator's step once phoenixd runs with auto-liquidity=off."""
+    fee_credit_sat = await _fee_credit_sat(config)
+    from .db import notes
+
+    notes.record_fee_credit_baseline(fee_credit_sat)
+    return fee_credit_sat
 
 
 def _log_version_once(version: Any) -> None:
@@ -377,7 +439,11 @@ async def _create_invoice_phoenixd(
     # would invoice a different amount than the one asked for
     if amount_msat % 1000:
         raise ValueError("The phoenixd backend can only mint whole-sat amounts.")
-    form = {"amountSat": str(amount_msat // 1000), "externalId": _external_id(config)}
+    form = {
+        "amountSat": str(amount_msat // 1000),
+        "externalId": _external_id(config),
+        "expirySeconds": str(_INVOICE_EXPIRY_SECONDS),
+    }
     description_hash: str | None = None
     if description_for_hash is None:
         if len(memo) > _MAX_DESCRIPTION_LENGTH:
@@ -388,7 +454,10 @@ async def _create_invoice_phoenixd(
         # invoice to a hash nobody's request has
         description_hash = sha256(description_for_hash.encode()).hexdigest()
         form["descriptionHash"] = description_hash
-    await _refuse_fee_credit(config)
+    # fails closed: an unreadable fee credit raises here, too
+    problem = await _fee_credit_problem(config)
+    if problem is not None:
+        raise ValueError(problem)
     status, body = await _call(config, "POST", "/createinvoice", form)
     _require_ok(status, body, "createinvoice")
     created = _json_object(body, "createinvoice")
@@ -576,22 +645,37 @@ async def _fetch_node_info_phoenixd(config: LightningBackendConfig) -> NodeInfo:
     if not isinstance(node_id, str) or not node_id:
         raise ValueError("phoenixd did not report its node id.")
     _log_version_once(info.get("version"))
+    # Past this point phoenixd is reachable, and this function returns: the
+    # health check it serves also gates reconciling pending melts (see
+    # server.py), which must go on whatever else is wrong - so the checks
+    # below only ever warn (_report_degraded), and each blocks just the
+    # part of the mint it concerns on its own.
+    #
     # getinfo answers the limited-access password too, but melting needs the
     # full-access one. An empty /payinvoice form tells them apart without
     # paying anything - phoenixd reads the invoice it requires before it
     # could ever pay: refused for that missing invoice (400) once past the
     # full-access check, with 401 before it. Only that 400 proves the
-    # password, so this health check catches the misconfiguration instead
-    # of every melt failing on it
+    # password (every melt meets the same 401 and is refused cleanly).
     status, body = await _call(config, "POST", "/payinvoice", {})
+    melting_problem = None
     if status == 401:
-        raise ValueError(
-            "phoenixd accepts this password for reading only: FUNDINGSOURCE_PHOENIXD_PASSWORD must be "
-            "phoenix.conf's full-access http-password, not http-password-limited-access."
+        melting_problem = (
+            "phoenixd accepts this password for reading only, so every melt is refused: "
+            "FUNDINGSOURCE_PHOENIXD_PASSWORD must be phoenix.conf's full-access http-password, "
+            "not http-password-limited-access."
         )
-    if status != 400:
-        raise ValueError(f"phoenixd answered the password probe with {status}, not 400: {_detail(body)}")
-    await _refuse_fee_credit(config)
+    elif status != 400:
+        melting_problem = (
+            f"phoenixd answered the password probe with {status}, not 400, so full access is unconfirmed: "
+            f"{_detail(body)}"
+        )
+    _report_degraded("melting", melting_problem)
+    try:
+        minting_problem = await _fee_credit_problem(config)
+    except Exception as exc:  # create_invoice meets the same error and refuses
+        minting_problem = f"phoenixd's fee credit could not be read, so minting is refused: {exc}"
+    _report_degraded("minting", minting_problem)
     channels = [channel for channel in info.get("channels") or [] if isinstance(channel, dict)]
     states = [channel.get("state") for channel in channels]
     # phoenixd's channels are private ones with ACINQ's LSP, its only peer:
@@ -606,3 +690,26 @@ async def _fetch_node_info_phoenixd(config: LightningBackendConfig) -> NodeInfo:
         num_peers=1 if "Normal" in states else 0,
         capacity=0,
     )
+
+
+def main(argv: list[str] | None = None) -> None:
+    """python -m lnurl_mint.phoenixd record-fee-credit-baseline - run once,
+    with the mint's own settings, after switching phoenixd to
+    auto-liquidity=off (see record_fee_credit_baseline and the README)."""
+    import argparse
+    import asyncio
+
+    from .config import settings
+
+    parser = argparse.ArgumentParser(prog="python -m lnurl_mint.phoenixd")
+    parser.add_argument("command", choices=["record-fee-credit-baseline"])
+    parser.parse_args(argv)
+    config = settings.funding_source()
+    if config.backend != "phoenixd":
+        raise SystemExit("FUNDINGSOURCE_BACKEND is not phoenixd.")
+    fee_credit_sat = asyncio.run(record_fee_credit_baseline(config))
+    print(f"Recorded phoenixd's fee credit of {fee_credit_sat} sat as the baseline in {settings.database_path}.")
+
+
+if __name__ == "__main__":
+    main()

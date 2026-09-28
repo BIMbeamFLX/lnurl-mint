@@ -590,7 +590,7 @@ The mint refuses to start unless all of this holds (see `config.py`):
 
 - **The full-access password.** phoenix.conf holds two, and melting calls
   `/payinvoice`, which `http-password-limited-access` cannot - the health
-  check probes for exactly that mistake. The password can spend the node's
+  check warns about exactly that mistake. The password can spend the node's
   whole balance, so the URL must be loopback; any other host needs
   `https://` *and* `FUNDINGSOURCE_PHOENIXD_ALLOW_REMOTE=true`. It is never
   logged, never taken from the URL, and requests ignore proxy/netrc
@@ -602,7 +602,10 @@ The mint refuses to start unless all of this holds (see `config.py`):
   Wallets pin it: **never change it, and back it up together with
   `DATABASE_PATH`** - phoenixd's seed restores the funds, not this key.
   The database remembers the first `mintPubkey`, and the mint refuses to
-  start with a key that yields another.
+  start with a key that yields another. Started with a wrong key by
+  mistake? Only if no note was ever issued under it, stop the mint and
+  `DELETE FROM meta WHERE key = 'mint_pubkey'` in `DATABASE_PATH` - once a
+  wallet holds a note, the first key is the mint's for good.
 - **Whole sats.** phoenixd invoices whole sats only, so
   `MIN_SENDABLE_MSAT`, `MAX_SENDABLE_MSAT` and `MIN_MINT_MSAT` must be
   multiples of 1000 (a wallet asking for a fractional amount anyway is
@@ -628,16 +631,22 @@ none arrives short by a liquidity fee either). So:
 
 1. Before the mint is reachable, bootstrap the channel with phoenixd's
    defaults (`auto-liquidity=2m`): pay it an invoice made in phoenixd
-   itself until a channel is open and `GET /getbalance` shows
-   `feeCreditSat` 0 - only a liquidity purchase uses fee credit up.
+   itself until a channel with enough inbound liquidity is open.
 2. Set `auto-liquidity=off` and `max-fee-credit=off` in phoenix.conf and
    restart phoenixd.
-3. To buy more inbound liquidity later, stop the mint first and let its
-   unpaid invoices expire (phoenixd's default: a day) before turning
-   auto-liquidity back on.
+3. Record the fee credit left over, in the mint's own environment:
+   `python -m lnurl_mint.phoenixd record-fee-credit-baseline` (it stores
+   `GET /getbalance`'s `feeCreditSat` in `DATABASE_PATH`). Some credit
+   usually stays for good: a liquidity purchase only spends its actual
+   fee, while credit builds up to the worst case.
+4. To buy more inbound liquidity later, stop the mint and let its unpaid
+   invoices expire (they are made to last an hour) before turning
+   auto-liquidity back on; after step 2, record the baseline anew.
 
-As a backstop the mint refuses to create invoices - and its health check
-fails - while `GET /getbalance` reports any fee credit.
+As a backstop the mint refuses to create invoices while phoenixd's fee
+credit is above that baseline (above 0 if none was recorded); credit that
+shrinks lowers the baseline with it, so any later growth counts. The health
+check only warns about it: melts, and reconciling pending ones, carry on.
 
 Behavioral differences worth knowing (details in `phoenixd.py`'s module
 docstring):

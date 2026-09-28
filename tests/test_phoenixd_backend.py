@@ -28,6 +28,7 @@ from coincurve import PrivateKey
 from fastapi.testclient import TestClient
 from pydantic import SecretStr, ValidationError
 
+import lnurl_mint.db as db_module
 import lnurl_mint.node as node_module
 import lnurl_mint.phoenixd as phoenixd_module
 import lnurl_mint.router as router_module
@@ -251,7 +252,7 @@ class FakePhoenixd:
 
 
 @pytest.fixture
-def phoenixd(monkeypatch: pytest.MonkeyPatch) -> FakePhoenixd:
+def phoenixd(monkeypatch: pytest.MonkeyPatch, tmp_path) -> FakePhoenixd:
     fake = FakePhoenixd()
 
     def factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
@@ -260,6 +261,12 @@ def phoenixd(monkeypatch: pytest.MonkeyPatch) -> FakePhoenixd:
         return _RealAsyncClient(*args, transport=httpx.MockTransport(fake.handler), **kwargs)
 
     monkeypatch.setattr(httpx, "AsyncClient", factory)
+    # the backend's own bookkeeping, fresh per test: its logged-once state,
+    # and the store its fee credit baseline lives in (the suite's shared
+    # database keeps serving the router)
+    monkeypatch.setattr(phoenixd_module, "_degraded", {})
+    monkeypatch.setattr(phoenixd_module, "_logged_versions", set())
+    monkeypatch.setattr(db_module, "notes", NoteStore(str(tmp_path / "phoenixd-meta.db")))
     return fake
 
 
@@ -279,6 +286,8 @@ def test_create_invoice_posts_whole_sats_with_a_prefixed_external_id(phoenixd: F
         "amountSat": "21",
         "description": "a memo",
         "externalId": f"lnurlcash:{signing_pubkey_hex(CONFIG)}",
+        # an hour, not phoenixd's default day
+        "expirySeconds": "3600",
     }
     decoded = bolt11.decode(pr)
     assert decoded.amount_msat == 21_000
@@ -634,15 +643,28 @@ def test_fetch_node_info_reports_the_node_and_no_public_capacity(phoenixd: FakeP
     assert (info.num_channels, info.num_peers) == (1, 0)
 
 
-def test_the_health_probe_catches_the_limited_access_password(phoenixd: FakePhoenixd):
-    # getinfo answers the limited-access password too; the probe must not
-    with pytest.raises(ValueError, match="full-access"):
+def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [record.message for record in caplog.records if record.levelname == "WARNING"]
+
+
+def test_the_health_check_warns_about_the_limited_access_password(
+    phoenixd: FakePhoenixd, caplog: pytest.LogCaptureFixture
+):
+    # getinfo answers the limited-access password too; the probe does not.
+    # phoenixd is still reachable, so the check itself passes - it warns once
+    with caplog.at_level(logging.INFO):
+        assert _run(node_module.fetch_node_info(LIMITED_CONFIG)).uri == phoenixd.node_id
         _run(node_module.fetch_node_info(LIMITED_CONFIG))
-    _run(node_module.fetch_node_info(CONFIG))
+    reading_only = [message for message in _warnings(caplog) if "reading only" in message]
+    assert len(reading_only) == 1  # once, not on every health check
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        _run(node_module.fetch_node_info(CONFIG))
+    assert any("melting works again" in record.message for record in caplog.records)
     # an empty /payinvoice form - nothing was, or could have been, paid - sent
     # as a form, so phoenixd parses it and refuses it for the missing invoice
     probes = [call for call in phoenixd.calls if call.path == "/payinvoice"]
-    assert [(call.form, call.content_type) for call in probes] == [({}, "application/x-www-form-urlencoded")] * 2
+    assert [(call.form, call.content_type) for call in probes] == [({}, "application/x-www-form-urlencoded")] * 3
     assert phoenixd.outgoing == {}
 
 
@@ -654,31 +676,103 @@ def test_the_health_probe_catches_the_limited_access_password(phoenixd: FakePhoe
         httpx.Response(200, json={}),
     ],
 )
-def test_only_phoenixds_missing_invoice_refusal_proves_full_access(phoenixd: FakePhoenixd, answer: httpx.Response):
+def test_only_phoenixds_missing_invoice_refusal_proves_full_access(
+    phoenixd: FakePhoenixd, answer: httpx.Response, caplog: pytest.LogCaptureFixture
+):
     phoenixd.overrides["/payinvoice"] = answer
-    with pytest.raises(ValueError, match="not 400"):
+    with caplog.at_level(logging.WARNING):
         _run(node_module.fetch_node_info(CONFIG))
+    assert any("not 400" in message for message in _warnings(caplog))
 
 
-def test_fee_credit_stops_minting_and_fails_the_health_check(phoenixd: FakePhoenixd):
+def test_fee_credit_stops_minting_but_not_the_health_check(phoenixd: FakePhoenixd, caplog: pytest.LogCaptureFixture):
     # fee credit reads as a full payment but can never pay a melt: while
-    # phoenixd holds any, no invoice is made and the node is not healthy
+    # phoenixd holds any (no baseline recorded), no invoice is made - but
+    # phoenixd stays healthy, so pending melts keep being reconciled
     phoenixd.fee_credit_sat = 21
-    with pytest.raises(ValueError, match="fee credit"):
+    with pytest.raises(ValueError, match="no baseline is recorded"):
         _run(node_module.create_invoice(21_000, CONFIG))
     assert not any(call.path == "/createinvoice" for call in phoenixd.calls)
-    with pytest.raises(ValueError, match="fee credit"):
-        _run(node_module.fetch_node_info(CONFIG))
+    with caplog.at_level(logging.INFO):
+        assert _run(node_module.fetch_node_info(CONFIG)).uri == phoenixd.node_id
+    assert any("21 sat of fee credit" in message for message in _warnings(caplog))
 
     phoenixd.fee_credit_sat = 0
     assert _run(node_module.create_invoice(21_000, CONFIG))[0].startswith("lnbc")
-    assert _run(node_module.fetch_node_info(CONFIG)).uri == phoenixd.node_id
+    with caplog.at_level(logging.INFO):
+        _run(node_module.fetch_node_info(CONFIG))
+    assert any("minting works again" in record.message for record in caplog.records)
 
 
-def test_a_balance_without_a_fee_credit_figure_is_not_a_pass(phoenixd: FakePhoenixd):
+def test_fee_credit_is_measured_against_the_recorded_baseline(phoenixd: FakePhoenixd):
+    # a liquidity purchase leaves some credit behind for good - that much
+    # must not stop minting, only credit gained since
+    phoenixd.fee_credit_sat = 5
+    assert _run(phoenixd_module.record_fee_credit_baseline(CONFIG)) == 5
+    assert db_module.notes.fee_credit_baseline() == 5
+    assert _run(node_module.create_invoice(21_000, CONFIG))[0].startswith("lnbc")
+
+    phoenixd.fee_credit_sat = 6  # a payment landed in fee credit
+    with pytest.raises(ValueError, match="above its 5 sat baseline"):
+        _run(node_module.create_invoice(21_000, CONFIG))
+
+    # credit that shrinks (a liquidity purchase) lowers the baseline with it,
+    # so growth from there on counts, even below the old baseline
+    phoenixd.fee_credit_sat = 3
+    assert _run(node_module.create_invoice(21_000, CONFIG))[0].startswith("lnbc")
+    assert db_module.notes.fee_credit_baseline() == 3
+    phoenixd.fee_credit_sat = 4
+    with pytest.raises(ValueError, match="above its 3 sat baseline"):
+        _run(node_module.create_invoice(21_000, CONFIG))
+    # the health check lowers it too, and never raises it
+    phoenixd.fee_credit_sat = 1
+    _run(node_module.fetch_node_info(CONFIG))
+    assert db_module.notes.fee_credit_baseline() == 1
+    phoenixd.fee_credit_sat = 9
+    _run(node_module.fetch_node_info(CONFIG))
+    assert db_module.notes.fee_credit_baseline() == 1
+
+
+def test_the_stored_baseline_is_only_ever_lowered(tmp_path):
+    store = NoteStore(str(tmp_path / "baseline.db"))
+    assert store.fee_credit_baseline() is None
+    store.lower_fee_credit_baseline(3)  # nothing recorded, nothing to lower
+    assert store.fee_credit_baseline() is None
+    store.record_fee_credit_baseline(5)
+    store.lower_fee_credit_baseline(7)
+    assert store.fee_credit_baseline() == 5
+    store.lower_fee_credit_baseline(2)
+    assert store.fee_credit_baseline() == 2
+    store.record_fee_credit_baseline(8)  # only the operator's own step raises it
+    assert store.fee_credit_baseline() == 8
+
+
+def test_the_baseline_command_records_the_fee_credit(
+    phoenixd: FakePhoenixd, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+):
+    monkeypatch.setattr(settings, "fundingsource_backend", "phoenixd")
+    monkeypatch.setattr(settings, "fundingsource_phoenixd_url", PHOENIXD_URL)
+    monkeypatch.setattr(settings, "fundingsource_phoenixd_password", SecretStr(FULL))
+    monkeypatch.setattr(settings, "fundingsource_phoenixd_signing_key", SecretStr(SIGNING_KEY))
+    phoenixd.fee_credit_sat = 1_234
+    phoenixd_module.main(["record-fee-credit-baseline"])
+    assert db_module.notes.fee_credit_baseline() == 1_234
+    assert "1234 sat" in capsys.readouterr().out
+
+    monkeypatch.setattr(settings, "fundingsource_backend", "lnd")
+    with pytest.raises(SystemExit, match="not phoenixd"):
+        phoenixd_module.main(["record-fee-credit-baseline"])
+
+
+def test_an_unreadable_fee_credit_refuses_minting_and_only_warns_the_health_check(
+    phoenixd: FakePhoenixd, caplog: pytest.LogCaptureFixture
+):
     phoenixd.overrides["/getbalance"] = httpx.Response(200, json={"balanceSat": 90_000})
     with pytest.raises(ValueError, match="did not report its fee credit"):
         _run(node_module.create_invoice(21_000, CONFIG))
+    with caplog.at_level(logging.WARNING):
+        assert _run(node_module.fetch_node_info(CONFIG)).uri == phoenixd.node_id
+    assert any("could not be read" in message for message in _warnings(caplog))
 
 
 def test_the_version_is_logged_once_and_an_unchecked_one_warns(
@@ -1046,3 +1140,29 @@ def test_the_mint_refuses_to_start_once_its_signing_key_changed(
         with TestClient(app):
             pass
     assert server_module.notes.pin_mint_pubkey("anything else") == signing_pubkey_hex(CONFIG)
+
+
+def test_melts_are_still_reconciled_while_minting_is_blocked(
+    mint: TestClient, phoenixd: FakePhoenixd, monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    # fee credit above its baseline stops minting only: phoenixd stays
+    # healthy, so boot and every monitor tick keep reconciling pending melts
+    # (which is how an unanswered melt's note is ever restored), and the
+    # mint-address discovery keeps advertising mintPubkey
+    phoenixd.fee_credit_sat = 21
+    monkeypatch.setattr(server_module, "notes", NoteStore(str(tmp_path / "boot.db")))
+    monkeypatch.setattr(settings, "funding_source_health_check_interval_seconds", 0.01)
+    reconciled: list[str | None] = []
+
+    async def record_reconcile(funding_source: LightningBackendConfig) -> None:
+        reconciled.append(funding_source.backend)
+
+    monkeypatch.setattr(server_module, "_reconcile_pending_melts_safely", record_reconcile)
+    with TestClient(app):
+        time.sleep(0.2)  # boot, then a few monitor ticks
+    assert len(reconciled) >= 2 and set(reconciled) == {"phoenixd"}
+
+    refused = mint.get("/p/cb", params={"amount": 21_000, "comment": urandom(32).hex()}).json()
+    assert refused["status"] == "ERROR"
+    assert not any(call.path == "/createinvoice" for call in phoenixd.calls)
+    assert mint.get(f"/.well-known/lnurlw/{settings.username}").json()["mintPubkey"] == signing_pubkey_hex(CONFIG)
