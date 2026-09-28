@@ -142,6 +142,9 @@ and a spark wallet's invoices are signed by its SSP anyway - so wallets
 verify spark-minted notes exactly like lnd/cln ones (see
 `spark._lud25_signing_key`; the derivation is cross-checked against
 `@scure/bip32` in the test suite). Rotating the mnemonic rotates the key.
+phoenixd has no signmessage either: it signs the same digest locally with a
+dedicated key the operator configures (`FUNDINGSOURCE_PHOENIXD_SIGNING_KEY`,
+see "phoenixd funding source" below).
 There's no separate setting for this: without a funding
 source, both fields are simply omitted, same as any other unconfigured
 optional field, and signing failures (e.g. a briefly unreachable node) are
@@ -276,9 +279,9 @@ hundred unpaid zap invoices of the last hour. It attests to what was paid,
 not to whom the payer meant it: it holds no Nostr key for a username, so `p`
 is whatever the zapper's client put there, and a receipt naming another
 username's owner here is one a client cannot tell from a real one. Every
-multi-user LNURL provider signing with one key has the same gap. Needs an lnd or
-cln funding source, the two that let a caller set an invoice's description
-hash; on spark zaps stay off. The fixed identity (`USERNAME`/`_`) is never
+multi-user LNURL provider signing with one key has the same gap. Needs an lnd,
+cln or phoenixd funding source, the ones that let a caller set an invoice's
+description hash; on spark zaps stay off. The fixed identity (`USERNAME`/`_`) is never
 zappable: it has no branch for the note to land on.
 
 **Verify** (optional, [LUD-21](../luds/21.md)): set `VERIFY_ENABLED=true` to
@@ -404,9 +407,10 @@ FORWARDED_ALLOW_IPS=* uv run uvicorn lnurl_mint.server:app --reload
 ```
 
 Configure the funding source via `.env` (see `.env.example`): lnd or cln REST,
-or a [spark](https://github.com/breez/spark-sdk) wallet (see "Spark
-funding source" below). Without one, minting and melting are unavailable
-(rotate/split/merge of existing notes still work).
+a [spark](https://github.com/breez/spark-sdk) wallet (see "Spark
+funding source" below), or [phoenixd](https://github.com/ACINQ/phoenixd)
+(see "phoenixd funding source" below). Without one, minting and melting are
+unavailable (rotate/split/merge of existing notes still work).
 
 Run exactly **one process** per `DATABASE_PATH`: no `--workers` greater than 1,
 and no second container sharing the same database file. Note reservation,
@@ -548,6 +552,86 @@ uv run python scripts/spark_mainnet_check.py --api-key-file breez-api.key
 The nix package does not ship this backend (the prebuilt wheel isn't
 packaged in nixpkgs) - use uv or Docker (`uv sync --extra spark` in your
 own image build) for spark-funded mints.
+
+### phoenixd funding source
+
+`FUNDINGSOURCE_BACKEND=phoenixd` funds the mint from
+[phoenixd](https://github.com/ACINQ/phoenixd), ACINQ's headless Phoenix -
+a Lightning node whose channels and inbound liquidity come from ACINQ's
+LSP rather than from the operator. The whole node contract is implemented
+in `lnurl_mint/phoenixd.py`, over phoenixd's HTTP API (no extra
+dependency):
+
+```sh
+FUNDINGSOURCE_BACKEND=phoenixd
+FUNDINGSOURCE_PHOENIXD_URL=http://127.0.0.1:9740
+FUNDINGSOURCE_PHOENIXD_PASSWORD=<http-password from ~/.phoenix/phoenix.conf>
+FUNDINGSOURCE_PHOENIXD_SIGNING_KEY=<32 bytes hex, e.g. openssl rand -hex 32>
+BASE_FEE_MSAT=4000        # at least phoenixd's own melt fee, see below
+FEE_PERCENT_PPM=4000
+```
+
+The mint refuses to start unless all of this holds (see `config.py`):
+
+- **The full-access password.** phoenix.conf holds two, and melting calls
+  `/payinvoice`, which `http-password-limited-access` cannot - the health
+  check probes for exactly that mistake. The password can spend the node's
+  whole balance, so the URL must be loopback; any other host needs
+  `https://` *and* `FUNDINGSOURCE_PHOENIXD_ALLOW_REMOTE=true`. It is never
+  logged, never taken from the URL, and requests ignore proxy/netrc
+  settings from the environment.
+- **A signing key of the mint's own.** phoenixd has no signmessage, so
+  LUD-25 certificates are signed locally with
+  `FUNDINGSOURCE_PHOENIXD_SIGNING_KEY` - same digest and wire format as
+  every other backend, and `mintPubkey` is this key, not the node id.
+  Wallets pin it: **never change it, and back it up together with
+  `DATABASE_PATH`** - phoenixd's seed restores the funds, not this key.
+- **Whole sats.** phoenixd invoices whole sats only, so
+  `MIN_SENDABLE_MSAT`, `MAX_SENDABLE_MSAT` and `MIN_MINT_MSAT` must be
+  multiples of 1000 (a wallet asking for a fractional amount anyway gets a
+  logged error, as with spark). Melts are paid at the invoice's exact msat
+  amount.
+- **A mint fee covering phoenixd's.** Every payment phoenixd sends goes
+  through ACINQ's trampoline at a fixed 4 sat + 0.4%, and `/payinvoice`
+  takes no fee limit. So a melt whose fee under that rule would exceed its
+  budget (`router._melt_fee_limit_msat`) is refused before anything is
+  sent, and its note restores; a fee phoenixd reports above budget anyway
+  is logged. The budget is sized from the mint fee, hence
+  `BASE_FEE_MSAT >= 4000` and `FEE_PERCENT_PPM >= 4000` - below that,
+  melts between roughly 250 and 4000 sat could never be paid.
+
+Behavioral differences worth knowing (details in `phoenixd.py`'s module
+docstring):
+
+- **Settled means the money arrived.** An invoice counts once phoenixd
+  reports it paid *and* its `receivedSat` covers the amount the invoice
+  asked for. phoenixd takes liquidity fees (a channel open or splice) out
+  of the incoming payment itself, so such a payment arrives short and never
+  mints - logged as a warning for the operator to settle by hand. **Buy
+  inbound liquidity before opening the mint**, and mind phoenixd's fee
+  credit: without a channel, incoming sats become fee credit the node
+  cannot spend on melts.
+- **The mint never holds a mint-invoice's preimage**, as with spark:
+  phoenixd picks it, and LUD-21 verify serves it only once settled
+  (phoenixd itself reports it before payment, too).
+- **A melt payment phoenixd has no record of was never sent** - phoenixd
+  stores a payment before its HTLC leaves, like lnd and cln - so that note
+  restores; one still in flight (a hodl invoice) stays pending until
+  phoenixd reports an outcome.
+- **Zaps work**: phoenixd sets description hashes.
+- **Every invoice carries `externalId=lnurlcash:<mintPubkey>`**, so a
+  phoenixd shared with other applications can still list this mint's
+  receipts (`GET /payments/incoming?externalId=...&all=true`). Sharing a
+  node mixes custody, though: its balance then backs more than this mint's
+  notes.
+- **The frontend's Peers row** shows whether the LSP is connected, and
+  Capacity stays 0: phoenixd's channel is private.
+
+phoenixd runs on mainnet and testnet only (no regtest), so the test suite
+exercises this backend against a fake phoenixd (`tests/test_phoenixd_backend.py`);
+try a live one with small amounts first. The nix module has no dedicated
+options for it - set the variables through `settings` and
+`environmentFiles` (the password and signing key belong in the latter).
 
 ## Docker
 
