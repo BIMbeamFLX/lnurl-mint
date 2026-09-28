@@ -207,11 +207,12 @@ async def is_payment_complete(payment_hash: str, config: LightningBackendConfig)
 async def invoice_preimage(payment_hash: str, config: LightningBackendConfig) -> bytes | None:
     """The preimage of an invoice this mint issued, if it has settled -
     fetched live from the funding source rather than cached anywhere (see
-    db.NoteStore's store-hashes-not-secrets policy), since for lnurlcash
-    this preimage IS the bearer note's spend secret. Used by LUD-21 verify
-    to hand it to a wallet with no node of its own, letting it claim and
-    rotate the note immediately, closing the exposure window before anyone
-    else who saw the invoice can race it."""
+    db.NoteStore's store-hashes-not-secrets policy). Used by LUD-21 verify
+    and NIP-57 zap receipts as proof of payment: since LUD-25 comment
+    protection became mandatory it no longer opens the note it paid for
+    (that is keyed by the WALLET's comment - see router._pay_callback),
+    but it must still never be returned before the invoice settles, where
+    it would prove a payment that never happened."""
     return await _dispatch("invoice_preimage", config, _invoice_preimage_lnd, _invoice_preimage_cln, payment_hash)
 
 

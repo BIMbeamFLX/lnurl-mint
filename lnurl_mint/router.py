@@ -983,6 +983,10 @@ async def _pay_callback(
         raise HTTPException(HTTPStatus.BAD_REQUEST, "Amount too low.")
     if amount > settings.max_sendable_msat:
         raise HTTPException(HTTPStatus.BAD_REQUEST, "Amount too high.")
+    # phoenixd invoices whole sats only (see phoenixd.py) - a fractional
+    # amount is the wallet's to fix, not an internal error of this mint's
+    if amount % 1000 and settings.fundingsource_backend == "phoenixd":
+        raise HTTPException(HTTPStatus.BAD_REQUEST, "Amount must be a whole number of sats.")
     net_amount_msat = amount - _mint_fee_msat(amount)
     if net_amount_msat < settings.min_mint_msat:
         raise HTTPException(

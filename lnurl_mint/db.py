@@ -99,6 +99,11 @@ class NoteStore:
                 " cx1 TEXT NOT NULL,"  # hex(P || chain_code), LUD-25's watch-only branch export
                 " next_index INTEGER NOT NULL DEFAULT 0)"  # see claim_next_index
             )
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS meta ("
+                " key TEXT PRIMARY KEY,"  # e.g. mint_pubkey, see pin_mint_pubkey
+                " value TEXT NOT NULL)"
+            )
             # databases from before these columns were renamed: a mint's note
             # was `comment_hash`, and a burn's outputs `h`/`h2` - the same
             # hex(Q) values, only renamed
@@ -683,6 +688,15 @@ class NoteStore:
                 index += 1
             self.conn.execute("UPDATE usernames SET next_index = ? WHERE username = ?", (index + 1, username))
             return pk_hex, index
+
+    def pin_mint_pubkey(self, pubkey: str) -> str:
+        """The mintPubkey this database was first run with - `pubkey`,
+        stored now if there is none yet. Wallets pin the key a mint signs
+        its notes with, so a differing answer means the configured key has
+        changed under this database (see server.py's lifespan)."""
+        with self._lock, self.conn:
+            self.conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('mint_pubkey', ?)", (pubkey,))
+            return self.conn.execute("SELECT value FROM meta WHERE key = 'mint_pubkey'").fetchone()[0]
 
 
 notes = NoteStore(settings.database_path)

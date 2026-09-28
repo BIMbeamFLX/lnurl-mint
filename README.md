@@ -586,11 +586,13 @@ The mint refuses to start unless all of this holds (see `config.py`):
   every other backend, and `mintPubkey` is this key, not the node id.
   Wallets pin it: **never change it, and back it up together with
   `DATABASE_PATH`** - phoenixd's seed restores the funds, not this key.
+  The database remembers the first `mintPubkey`, and the mint refuses to
+  start with a key that yields another.
 - **Whole sats.** phoenixd invoices whole sats only, so
   `MIN_SENDABLE_MSAT`, `MAX_SENDABLE_MSAT` and `MIN_MINT_MSAT` must be
-  multiples of 1000 (a wallet asking for a fractional amount anyway gets a
-  logged error, as with spark). Melts are paid at the invoice's exact msat
-  amount.
+  multiples of 1000 (a wallet asking for a fractional amount anyway is
+  refused with a 400-style LNURL error). Melts are paid at the invoice's
+  exact msat amount.
 - **A mint fee covering phoenixd's.** Every payment phoenixd sends goes
   through ACINQ's trampoline at a fixed 4 sat + 0.4%, and `/payinvoice`
   takes no fee limit. So a melt whose fee under that rule would exceed its
@@ -600,17 +602,37 @@ The mint refuses to start unless all of this holds (see `config.py`):
   `BASE_FEE_MSAT >= 4000` and `FEE_PERCENT_PPM >= 4000` - below that,
   melts between roughly 250 and 4000 sat could never be paid.
 
+**phoenixd itself must run with `auto-liquidity=off` and
+`max-fee-credit=off`** once it has its inbound liquidity. Without enough
+inbound liquidity, phoenixd books an incoming payment as *fee credit*: the
+API reports it paid in full, but those sats can only ever pay phoenixd's
+own liquidity fees, never a melt - a note minted for one would be backed by
+nothing, and nothing in the API tells such a payment apart. With both
+settings off, a payment the channel cannot take is refused instead (and
+none arrives short by a liquidity fee either). So:
+
+1. Before the mint is reachable, bootstrap the channel with phoenixd's
+   defaults (`auto-liquidity=2m`): pay it an invoice made in phoenixd
+   itself until a channel is open and `GET /getbalance` shows
+   `feeCreditSat` 0 - only a liquidity purchase uses fee credit up.
+2. Set `auto-liquidity=off` and `max-fee-credit=off` in phoenix.conf and
+   restart phoenixd.
+3. To buy more inbound liquidity later, stop the mint first and let its
+   unpaid invoices expire (phoenixd's default: a day) before turning
+   auto-liquidity back on.
+
+As a backstop the mint refuses to create invoices - and its health check
+fails - while `GET /getbalance` reports any fee credit.
+
 Behavioral differences worth knowing (details in `phoenixd.py`'s module
 docstring):
 
 - **Settled means the money arrived.** An invoice counts once phoenixd
   reports it paid *and* its `receivedSat` covers the amount the invoice
-  asked for. phoenixd takes liquidity fees (a channel open or splice) out
-  of the incoming payment itself, so such a payment arrives short and never
-  mints - logged as a warning for the operator to settle by hand. **Buy
-  inbound liquidity before opening the mint**, and mind phoenixd's fee
-  credit: without a channel, incoming sats become fee credit the node
-  cannot spend on melts.
+  asked for. With auto-liquidity on, phoenixd takes liquidity fees (a
+  channel open or splice) out of the incoming payment itself, so such a
+  payment arrives short and never mints - logged as a warning for the
+  operator to settle by hand.
 - **The mint never holds a mint-invoice's preimage**, as with spark:
   phoenixd picks it, and LUD-21 verify serves it only once settled
   (phoenixd itself reports it before payment, too).
@@ -626,6 +648,19 @@ docstring):
   notes.
 - **The frontend's Peers row** shows whether the LSP is connected, and
   Capacity stays 0: phoenixd's channel is private.
+- **Checked versions**: the fee rule is the same from phoenixd v0.5.1
+  through v0.9.1. The health check logs phoenixd's version once and warns
+  for any other - confirm `phoenixd.TRAMPOLINE_FEE_*` there before relying
+  on melt fee budgets.
+
+**A melt stuck pending (runbook).** phoenixd stores a payment as pending
+before its HTLC leaves the node. If phoenixd crashes in between, that
+payment can stay `Pending` for good with no HTLC behind it - and the mint
+never releases a note whose payment phoenixd calls pending. Check
+`GET /payments/outgoingbyhash/<payment hash>` and phoenixd's logs; once you
+are certain nothing went out, release the note by hand, with the mint
+stopped: `UPDATE notes SET pending = 0, pending_payment_hash = NULL WHERE
+pending_payment_hash = '<payment hash>'` in `DATABASE_PATH`.
 
 phoenixd runs on mainnet and testnet only (no regtest), so the test suite
 exercises this backend against a fake phoenixd (`tests/test_phoenixd_backend.py`);

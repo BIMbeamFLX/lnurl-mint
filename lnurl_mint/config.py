@@ -18,8 +18,16 @@ class Settings(BaseSettings):
     # dotenv value (env_ignore_empty only skips *that* source, falling
     # through to the next-lowest, i.e. right back to the dotenv file), so
     # the file itself must not be read at all instead.
+    #
+    # hide_input_in_errors: a failed validation otherwise quotes the raw
+    # input - every setting, secrets included (credentials, the phoenixd
+    # password and signing key) - into the error a failed start prints.
+    # The error's .errors() still carries it: never log that.
     model_config = SettingsConfigDict(
-        env_file=os.environ.get("LNURL_MINT_ENV_FILE", ".env"), env_file_encoding="utf-8", extra="ignore"
+        env_file=os.environ.get("LNURL_MINT_ENV_FILE", ".env"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+        hide_input_in_errors=True,
     )
 
     # this mint's own funding source, configured once by the operator - used

@@ -10,6 +10,7 @@ from fastapi.openapi.utils import get_openapi
 
 from . import __version__
 from .config import settings
+from .db import notes
 from .errors import log_internal_error
 from .frontend import frontend_router
 from .node import LightningBackendConfig, fetch_node_info
@@ -114,6 +115,20 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     # behavior, and every route still probes the funding source fresh on
     # its own.
     funding_source = settings.funding_source()
+    # phoenixd signs notes with a configured key (see phoenixd.py), which
+    # wallets pin as this mint's mintPubkey - a different one would have
+    # every wallet refuse every note from here on. So the database keeps the
+    # first, and a mint whose key no longer matches it does not start.
+    if funding_source.backend == "phoenixd":
+        from .phoenixd import signing_pubkey_hex
+
+        pubkey = signing_pubkey_hex(funding_source)
+        pinned = notes.pin_mint_pubkey(pubkey)
+        if pinned != pubkey:
+            raise RuntimeError(
+                f"FUNDINGSOURCE_PHOENIXD_SIGNING_KEY yields mintPubkey {pubkey}, but {settings.database_path} "
+                f"was first run with {pinned}, which wallets have pinned - restore the original signing key."
+            )
     monitor_task: asyncio.Task | None = None
     zap_task: asyncio.Task | None = None
     if not funding_source.backend:

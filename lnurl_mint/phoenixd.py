@@ -13,7 +13,8 @@ endpoints:
                       -> GET /payments/incoming/{paymentHash}
 - is_payment_complete / payment_preimage
                       -> GET /payments/outgoingbyhash/{paymentHash}
-- fetch_node_info     -> GET /getinfo (plus a password-scope probe)
+- fetch_node_info     -> GET /getinfo (plus a password-scope probe and
+                         GET /getbalance's fee credit)
 - sign_message        -> signed locally (LUD-25 digest, configured key)
 
 Authentication is HTTP Basic with an empty username. phoenix.conf holds
@@ -46,8 +47,20 @@ counts as settled only once isPaid AND receivedSat covers the amount the
 invoice asked for (read off the invoice) - a short-paid invoice never
 mints a note worth more than arrived. phoenixd also reports an incoming
 payment's preimage from the moment the invoice exists; invoice_preimage
-withholds it until settlement, the same rule lnd's LookupInvoice echo
-needs.
+withholds it until settlement - it is proof of payment, and handing it
+out earlier would prove a payment that never happened.
+
+**Fee credit is not money.** Without inbound liquidity, phoenixd books an
+incoming payment as fee credit (lightning-kmp's Part.FeeCredit): isPaid,
+receivedSat and completedAt all read as a full payment, but the sats can
+only ever pay future liquidity fees - never a melt. A note minted for one
+would be backed by nothing, and the API cannot tell such a payment from a
+real one. So the operator must run phoenixd with auto-liquidity=off and
+max-fee-credit=off once inbound liquidity is bought (payments that do not
+fit the channel are then refused outright, instead of landing in fee
+credit or arriving short by a liquidity fee), and as a backstop
+create_invoice and the health check refuse while GET /getbalance reports
+any fee credit at all.
 
 **The melt fee is phoenixd's fixed rule, not a cap we pass.** /payinvoice
 takes no fee limit: every payment goes through ACINQ's trampoline, which
@@ -57,7 +70,9 @@ budget BEFORE anything is sent (phoenixd then has no record of it and the
 note restores cleanly), and warns if the fee phoenixd reports afterwards
 is over budget anyway (the rule changed under us - update the constants).
 config.py refuses a mint fee that does not cover the rule, since the
-router sizes every melt's budget from the mint fee.
+router sizes every melt's budget from the mint fee. The rule is the same
+from v0.5.1 through v0.9.1; the health check logs phoenixd's version
+once and warns for any other.
 
 **Absence is "never sent".** lightning-kmp, phoenixd's Lightning engine,
 stores an outgoing payment as pending before its HTLC leaves the node, as
@@ -81,7 +96,9 @@ the operator provides a dedicated secp256k1 key
 (FUNDINGSOURCE_PHOENIXD_SIGNING_KEY) and notes are signed locally over the
 spec digest, exactly like spark's seed-derived key. Wallets pin the
 mintPubkey it yields and refuse a mint whose key changed, so it must never
-change - back it up with the database, not just phoenixd's seed.
+change - back it up with the database, not just phoenixd's seed. The
+database remembers the first one, and server.py refuses to start with
+any other.
 
 **Every invoice carries externalId "lnurlcash:<mintPubkey>"**, so a
 phoenixd shared with other applications (which prefix their own ids) can
@@ -95,7 +112,7 @@ import logging
 import re
 from hashlib import sha256
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 import bolt11
 import httpx
@@ -128,6 +145,12 @@ _HEX32_RE = re.compile(r"[0-9a-fA-F]{64}")
 # lightning-kmp channel states (ChannelState.stateName) of a channel that
 # no longer counts as one
 _GONE_CHANNEL_STATES = {"Closing", "Closed", "Aborted"}
+
+# the phoenixd versions whose fee rule (TRAMPOLINE_FEE_*) was checked
+# against their source - unchanged from v0.5.1 through v0.9.1
+_FEE_RULE_CHECKED_VERSIONS = ((0, 5, 1), (0, 9, 1))
+# phoenixd versions (getinfo's "0.9.1-<commit>") already logged by this process
+_logged_versions: set[str] = set()
 
 
 def trampoline_fee_msat(amount_msat: int) -> int:
@@ -226,15 +249,22 @@ async def _call(
     timeout: float = _TIMEOUT_SECONDS,
 ) -> tuple[int, bytes]:
     """One request to phoenixd's API, as (status code, body) - the body read
-    up to _MAX_RESPONSE_BYTES and no further."""
+    up to _MAX_RESPONSE_BYTES and no further. A `form`, even an empty one,
+    goes out as application/x-www-form-urlencoded: what phoenixd's handlers
+    parse their parameters from."""
     if not config.phoenixd_url or not config.phoenixd_password:
         raise ValueError("Url and password are required.")
     url = checked_url(config.phoenixd_url, config.phoenixd_allow_remote) + path
     # Basic with an EMPTY username - what phoenixd expects
     auth = httpx.BasicAuth("", config.phoenixd_password.get_secret_value())
+    content: bytes | None = None
+    headers: dict[str, str] = {}
+    if form is not None:
+        content = urlencode(form).encode()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
     body = bytearray()
     async with httpx.AsyncClient(verify=config.verify, timeout=timeout, trust_env=False) as client:
-        async with client.stream(method, url, data=form, auth=auth) as res:
+        async with client.stream(method, url, content=content, headers=headers, auth=auth) as res:
             status = res.status_code
             async for chunk in res.aiter_bytes():
                 body += chunk
@@ -293,6 +323,45 @@ def _external_id(config: LightningBackendConfig) -> str:
     return f"{EXTERNAL_ID_PREFIX}{signing_pubkey_hex(config)}"
 
 
+async def _refuse_fee_credit(config: LightningBackendConfig) -> None:
+    """Raises while GET /getbalance reports any fee credit: sats phoenixd can
+    only spend on its own liquidity fees, which a note minted for them would
+    stand on - see the module docstring."""
+    status, body = await _call(config, "GET", "/getbalance")
+    _require_ok(status, body, "getbalance")
+    fee_credit_sat = _json_object(body, "getbalance").get("feeCreditSat")
+    if not isinstance(fee_credit_sat, int):
+        raise ValueError("phoenixd did not report its fee credit.")
+    if fee_credit_sat > 0:
+        raise ValueError(
+            f"phoenixd holds {fee_credit_sat} sat of fee credit, which no melt can spend - minting stays off "
+            "while any remains. Run phoenixd with auto-liquidity=off and max-fee-credit=off once inbound "
+            "liquidity is bought (only a liquidity purchase uses fee credit up)."
+        )
+
+
+def _log_version_once(version: Any) -> None:
+    """Logs phoenixd's version the first time this process sees it - and
+    warns unless the fee rule (TRAMPOLINE_FEE_*) was checked against it."""
+    shown = version if isinstance(version, str) and version else "(no version reported)"
+    if shown in _logged_versions:
+        return
+    _logged_versions.add(shown)
+    match = re.match(r"(\d+)\.(\d+)\.(\d+)", shown)
+    number = tuple(int(part) for part in match.groups()) if match else None
+    oldest, newest = _FEE_RULE_CHECKED_VERSIONS
+    if number is not None and oldest <= number <= newest:
+        logging.info("phoenixd %s: its fee rule is the one this backend checks melts against.", shown)
+    else:
+        logging.warning(
+            "phoenixd %s: not a version whose fee rule (%d msat + %d ppm) was checked (v0.5.1 to v0.9.1) - "
+            "confirm phoenixd.TRAMPOLINE_FEE_* before relying on melt fee budgets.",
+            shown,
+            TRAMPOLINE_FEE_BASE_MSAT,
+            TRAMPOLINE_FEE_PPM,
+        )
+
+
 async def _create_invoice_phoenixd(
     amount_msat: int,
     config: LightningBackendConfig,
@@ -314,6 +383,7 @@ async def _create_invoice_phoenixd(
         # invoice to a hash nobody's request has
         description_hash = sha256(description_for_hash.encode()).hexdigest()
         form["descriptionHash"] = description_hash
+    await _refuse_fee_credit(config)
     status, body = await _call(config, "POST", "/createinvoice", form)
     _require_ok(status, body, "createinvoice")
     created = _json_object(body, "createinvoice")
@@ -492,17 +562,23 @@ async def _fetch_node_info_phoenixd(config: LightningBackendConfig) -> NodeInfo:
     node_id = info.get("nodeId")
     if not isinstance(node_id, str) or not node_id:
         raise ValueError("phoenixd did not report its node id.")
+    _log_version_once(info.get("version"))
     # getinfo answers the limited-access password too, but melting needs the
     # full-access one. An empty /payinvoice form tells them apart without
-    # paying anything: refused for its missing invoice (400) past the
-    # full-access check, 401 before it - so this health probe catches the
-    # misconfiguration instead of every melt failing on it
-    status, _ = await _call(config, "POST", "/payinvoice", {})
+    # paying anything - phoenixd reads the invoice it requires before it
+    # could ever pay: refused for that missing invoice (400) once past the
+    # full-access check, with 401 before it. Only that 400 proves the
+    # password, so this health check catches the misconfiguration instead
+    # of every melt failing on it
+    status, body = await _call(config, "POST", "/payinvoice", {})
     if status == 401:
         raise ValueError(
             "phoenixd accepts this password for reading only: FUNDINGSOURCE_PHOENIXD_PASSWORD must be "
             "phoenix.conf's full-access http-password, not http-password-limited-access."
         )
+    if status != 400:
+        raise ValueError(f"phoenixd answered the password probe with {status}, not 400: {_detail(body)}")
+    await _refuse_fee_credit(config)
     channels = [channel for channel in info.get("channels") or [] if isinstance(channel, dict)]
     states = [channel.get("state") for channel in channels]
     # phoenixd's channels are private ones with ACINQ's LSP, its only peer:
