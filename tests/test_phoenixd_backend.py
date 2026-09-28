@@ -102,6 +102,8 @@ class FakePhoenixd:
         self.held: set[str] = set()
         # canned answers by path, ahead of everything else
         self.overrides: dict[str, httpx.Response] = {}
+        # transport errors by path, raised before any answer (e.g. ConnectError)
+        self.transport_errors: dict[str, type[httpx.TransportError]] = {}
         # what a lookup that finds nothing answers - phoenixd's 204, as its
         # StatusPages plugin rewrites it
         self.not_found = (404, "Not found")
@@ -123,6 +125,8 @@ class FakePhoenixd:
             username, _, password = b64decode(authorization[6:]).decode().partition(":")
         form = {key: values[0] for key, values in parse_qs(request.content.decode(), keep_blank_values=True).items()}
         path = request.url.path
+        if path in self.transport_errors:
+            raise self.transport_errors[path]("phoenixd is not listening", request=request)
         self.calls.append(Call(request.method, path, form, username, password, request.headers.get("content-type")))
         if password not in (FULL, LIMITED):
             return httpx.Response(
@@ -450,6 +454,49 @@ def test_a_fee_over_budget_after_the_fact_is_logged(phoenixd: FakePhoenixd, capl
     # paid - nothing to undo - but loud: phoenixd's fee rule changed
     assert result == PaymentResult(preimage, 9_000)
     assert any("over its 5000 msat budget" in record.message for record in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        httpx.Response(400, text="Request parameter invoice couldn't be parsed/converted to bolt11invoice"),
+        httpx.Response(401, text="Invalid authentication (use basic auth with the http password set in phoenix.conf)"),
+    ],
+)
+def test_phoenixds_own_refusals_are_clean_payment_failures(phoenixd: FakePhoenixd, answer: httpx.Response):
+    # phoenixd answers 400/401 before it hands anything to its peer - nothing
+    # can be queued, so the router may restore at once after confirming
+    phoenixd.overrides["/payinvoice"] = answer
+    with pytest.raises(PaymentFailed):
+        _run(node_module.pay_invoice(fake_invoice(21_000, "ab" * 32), CONFIG, fee_limit_msat=5_000))
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        httpx.Response(403, text="Forbidden"),  # a reverse proxy's
+        httpx.Response(404, text="Unknown endpoint (check api doc)"),
+        httpx.Response(500, text="Internal error"),
+        httpx.Response(502, text="Bad Gateway"),
+        httpx.Response(504, text="Gateway Timeout"),
+    ],
+)
+def test_any_other_status_is_ambiguous_not_a_clean_failure(phoenixd: FakePhoenixd, answer: httpx.Response):
+    # none of these proves phoenixd never queued the request - they must not
+    # skip the router's grace period the way a PaymentFailed does
+    phoenixd.overrides["/payinvoice"] = answer
+    with pytest.raises(ValueError) as failed:
+        _run(node_module.pay_invoice(fake_invoice(21_000, "ab" * 32), CONFIG, fee_limit_msat=5_000))
+    assert not isinstance(failed.value, PaymentFailed)
+
+
+@pytest.mark.parametrize("error", [httpx.ConnectError, httpx.ConnectTimeout])
+def test_a_request_that_never_reached_phoenixd_is_a_clean_failure(
+    phoenixd: FakePhoenixd, error: type[httpx.TransportError]
+):
+    phoenixd.transport_errors["/payinvoice"] = error
+    with pytest.raises(PaymentFailed, match="could not be reached"):
+        _run(node_module.pay_invoice(fake_invoice(21_000, "ab" * 32), CONFIG, fee_limit_msat=5_000))
 
 
 def test_the_limited_access_password_cannot_melt(phoenixd: FakePhoenixd):
@@ -914,7 +961,9 @@ def test_a_melt_phoenixd_cannot_afford_restores_the_note_unpaid(mint: TestClient
 
 
 @pytest.mark.parametrize("settles", [True, False])
-def test_a_melt_held_open_stays_pending_until_phoenixd_knows(mint: TestClient, phoenixd: FakePhoenixd, settles: bool):
+def test_a_melt_held_open_stays_pending_until_phoenixd_knows(
+    mint: TestClient, phoenixd: FakePhoenixd, settles: bool, monkeypatch: pytest.MonkeyPatch
+):
     k1, _, _ = _mint_note(mint, phoenixd, 21_000)
     melt_preimage = urandom(32)
     melt_hash = sha256(melt_preimage).hexdigest()
@@ -928,6 +977,9 @@ def test_a_melt_held_open_stays_pending_until_phoenixd_knows(mint: TestClient, p
     assert mint.get("/w", params={"k1": k1}).json()["reason"] == "pending"
 
     phoenixd.finish_held(melt_hash, melt_preimage if settles else None)
+    # its /payinvoice went unanswered, so a failure restores the note only
+    # past the grace period - long past, for an HTLC a payee held this long
+    monkeypatch.setattr(router_module, "_UNCONFIRMED_RESTORE_GRACE_SECONDS", 0)
     _run(router_module.reconcile_pending_melts(settings.funding_source()))
     after = mint.get("/w", params={"k1": k1}).json()
     if settles:
@@ -935,6 +987,31 @@ def test_a_melt_held_open_stays_pending_until_phoenixd_knows(mint: TestClient, p
     else:
         assert after["maxWithdrawable"] == 21_000
     assert phoenixd.paid_invoices() == [pr]
+
+
+def test_a_proxys_gateway_timeout_waits_out_the_grace_period(
+    mint: TestClient, phoenixd: FakePhoenixd, monkeypatch: pytest.MonkeyPatch
+):
+    # a 504 from a reverse proxy says nothing about whether phoenixd queued
+    # the payment, even though phoenixd has no record of it yet: the note
+    # stays pending, and only a restore after the grace period frees it
+    k1, _, _ = _mint_note(mint, phoenixd, 21_000)
+    phoenixd.overrides["/payinvoice"] = httpx.Response(504, text="Gateway Timeout")
+    assert mint.get("/w/cb", params={"k1": k1, "pr": fake_invoice(21_000)}).json()["status"] == "OK"
+    assert mint.get("/w", params={"k1": k1}).json()["reason"] == "pending"
+    _run(router_module.reconcile_pending_melts(settings.funding_source()))
+    assert mint.get("/w", params={"k1": k1}).json()["reason"] == "pending"
+
+    monkeypatch.setattr(router_module, "_UNCONFIRMED_RESTORE_GRACE_SECONDS", 0)
+    _run(router_module.reconcile_pending_melts(settings.funding_source()))
+    assert mint.get("/w", params={"k1": k1}).json()["maxWithdrawable"] == 21_000
+
+
+def test_phoenixds_own_refusal_restores_the_note_at_once(mint: TestClient, phoenixd: FakePhoenixd):
+    k1, _, _ = _mint_note(mint, phoenixd, 21_000)
+    phoenixd.overrides["/payinvoice"] = httpx.Response(400, text="Request parameter invoice is missing")
+    assert mint.get("/w/cb", params={"k1": k1, "pr": fake_invoice(21_000)}).json()["status"] == "OK"
+    assert mint.get("/w", params={"k1": k1}).json()["maxWithdrawable"] == 21_000
 
 
 def test_mint_address_discovery_advertises_the_signing_key(mint: TestClient, phoenixd: FakePhoenixd):

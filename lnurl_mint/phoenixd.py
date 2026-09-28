@@ -77,9 +77,14 @@ once and warns for any other.
 **Absence is "never sent".** lightning-kmp, phoenixd's Lightning engine,
 stores an outgoing payment as pending before its HTLC leaves the node, as
 lnd and cln do, so phoenixd having no record of a payment hash means
-nothing was ever sent for it: is_payment_complete answers False. A
-recorded payment without completedAt is still in flight - notably one a
-payee holds open with a hodl invoice - and raises, never False (see
+nothing was ever sent for it: is_payment_complete answers False. That
+holds once phoenixd has acted on the request - /payinvoice first queues it
+for its peer (lightning-kmp Peer.payInvoice), so unless phoenixd refused
+the request itself (400/401) or it never reached phoenixd, pay_invoice's
+failure is not a PaymentFailed, and the router waits out
+router._UNCONFIRMED_RESTORE_GRACE_SECONDS before believing it. A recorded
+payment without completedAt is still in flight - notably one a payee holds
+open with a hodl invoice - and raises, never False (see
 node.is_payment_complete). phoenixd itself also refuses to pay a hash it
 already paid or is paying, but the router never asks it to: a melt's
 invoice is never paid twice (see router.get_withdraw_callback).
@@ -419,15 +424,23 @@ async def _pay_invoice_phoenixd(invoice: str, config: LightningBackendConfig, fe
         raise PaymentFailed(
             f"phoenixd charges {fee_msat} msat to pay this invoice, over this melt's {fee_limit_msat} msat budget."
         )
-    status, body = await _call(config, "POST", "/payinvoice", {"invoice": invoice}, timeout=_PAY_TIMEOUT_SECONDS)
+    # PaymentFailed below is for outcomes that prove nothing is queued at
+    # phoenixd - the router restores those at once, and waits out
+    # router._UNCONFIRMED_RESTORE_GRACE_SECONDS for anything else: a request
+    # that never reached phoenixd, and phoenixd's own 401/400, which it
+    # answers before handing anything to its peer. Any other status (a
+    # reverse proxy's 403 or 504, phoenixd's own 500) is not such proof.
+    try:
+        status, body = await _call(config, "POST", "/payinvoice", {"invoice": invoice}, timeout=_PAY_TIMEOUT_SECONDS)
+    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+        raise PaymentFailed(f"phoenixd could not be reached: {exc}") from exc
     if status == 401:
         raise PaymentFailed(
             "phoenixd refused the password for /payinvoice (401) - it needs phoenix.conf's full-access "
             "http-password, not http-password-limited-access."
         )
-    if 400 <= status < 500:
-        # refused while parsing the request, before any payment was attempted
-        raise PaymentFailed(f"phoenixd refused the payment ({status}): {_detail(body)}")
+    if status == 400:
+        raise PaymentFailed(f"phoenixd refused the payment request (400): {_detail(body)}")
     _require_ok(status, body, "payinvoice")
     result = _json_object(body, "payinvoice")
     preimage_hex = result.get("paymentPreimage")

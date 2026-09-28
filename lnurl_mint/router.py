@@ -31,6 +31,7 @@ from .models import (
 )
 from .node import (
     LightningBackendConfig,
+    PaymentFailed,
     cached_fetch_node_info,
     create_invoice,
     invoice_preimage,
@@ -57,6 +58,31 @@ def _funding_source() -> LightningBackendConfig:
 # case a retry can actually fix) a chance to clear before _melt_pay gives
 # up and leaves the notes pending for manual reconciliation. ~31s total.
 _CONFIRMATION_RETRY_DELAYS_SECONDS = (1, 2, 4, 8, 16)
+
+# how long after a melt's attempt began (NoteStore.record_melt) "confirmed
+# not paid" is still not trusted to restore its note, unless the funding
+# source itself refused the payment (PaymentFailed). A request whose answer
+# never arrived (our timeout, a dropped connection) can still be waiting in
+# the node's own queue - phoenixd's peer, cln's xpay still routing - while
+# the node truthfully reports no such payment, and restoring then lets the
+# holder melt the same value again while the first payment goes out late.
+# Stored, not in-process, so a restart inside the window does not reopen it.
+# A heuristic, not a proof: a node that stalls for longer than this while
+# still answering lookups, then resumes, can still pay after the restore -
+# which is why reconcile_pending_melts logs every such restore loudly. It
+# runs on the wall clock (to survive restarts), so a clock jumping forward
+# shortens it.
+_UNCONFIRMED_RESTORE_GRACE_SECONDS = 60 * 60
+
+
+def _restorable(payment_hash: str) -> bool:
+    """Whether a melt confirmed not paid may have its note(s) restored yet -
+    once _UNCONFIRMED_RESTORE_GRACE_SECONDS have passed since its attempt
+    began. A melt with no recorded attempt time (from before it was
+    recorded) counts as long past it."""
+    attempted_at = notes.melt_attempted_at(payment_hash)
+    return attempted_at is None or time.time() - attempted_at >= _UNCONFIRMED_RESTORE_GRACE_SECONDS
+
 
 # payment hashes with a live, in-process melt attempt - registered by
 # get_withdraw_callback the moment mark_pending succeeds (before the
@@ -179,6 +205,17 @@ async def _melt_pay(
                 )
                 return
             if not completed:
+                # a refusal from the funding source itself means it acted
+                # on the request; any other failure may mean the request is
+                # still queued there - see _UNCONFIRMED_RESTORE_GRACE_SECONDS
+                if not isinstance(exc, PaymentFailed) and not _restorable(decoded.payment_hash):
+                    logging.info(
+                        "melt %s: not paid so far, but its request went unanswered (%s) - left pending "
+                        "for reconcile to restore once the grace period has passed",
+                        note_ids,
+                        exc,
+                    )
+                    return
                 logging.info("melt %s: confirmed not paid (%s) - restoring", note_ids, exc)
                 notes.restore(note_ids)
                 return
@@ -249,9 +286,30 @@ async def reconcile_pending_melts(funding_source: LightningBackendConfig) -> Non
             # routing fee unknown here too, same reason as _melt_pay's own
             # is_payment_complete-confirmed path
             log_melt(note_ids, amount_msat, None)
+        elif not _restorable(payment_hash):
+            # a leftover can't tell a refused request from an unanswered one
+            # - so every one waits out the grace period (see _restorable)
+            logging.info("reconcile: melt %s not paid so far, still within its grace period - left pending", note_ids)
         else:
             notes.restore(note_ids)
-            logging.info("reconcile: melt %s confirmed not paid at boot - restored", note_ids)
+            # a melt only reaches this restore if its payment request was
+            # never answered cleanly (a refused one restores in _melt_pay),
+            # and the grace period makes a late payment unlikely, not
+            # impossible - so say so where an operator will see it (stdout)
+            # and find it again (error.log), with the payment hash to check
+            # the funding source for
+            logging.warning(
+                "reconcile: melt %s (payment hash %s) restored - still no payment %ss or more after a request "
+                "that was never answered cleanly; check the funding source for a late payment",
+                note_ids,
+                payment_hash,
+                _UNCONFIRMED_RESTORE_GRACE_SECONDS,
+            )
+            log_internal_error(
+                f"reconcile: melt {note_ids} restored after its grace period - check the funding source "
+                "for a late payment",
+                RuntimeError(f"no payment found for payment_hash={payment_hash}"),
+            )
 
 
 def _created_invoice_payment_hash(pr: str) -> str:

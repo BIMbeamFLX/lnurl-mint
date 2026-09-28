@@ -145,6 +145,12 @@ class NoteStore:
             # 0, so a pre-migration row (correctly defaulted to 0) just costs
             # one such check the first time it's polled, same as before
             self._add_column_if_missing(self._conn, "melts", "settled", "INTEGER NOT NULL DEFAULT 0")
+            # when a melt's payment was handed to the funding source - see
+            # router._restorable: a melt whose outcome was never answered
+            # stays pending for a grace period after this, however often the
+            # process restarts. Rows from before it get 0: attempted "long
+            # ago", past any grace, the same treatment they got before
+            self._add_column_if_missing(self._conn, "melts", "attempted_at", "INTEGER NOT NULL DEFAULT 0")
             # NIP-57 zaps (see nostr.py): the kind 9734 request an invoice
             # was bound to, verbatim, and the id of the kind 9735 receipt
             # once one was published; both NULL for an ordinary mint.
@@ -498,9 +504,20 @@ class NoteStore:
         mint invoice's `pr` is always stored regardless of VERIFY_ENABLED -
         recording is cheap and lets the endpoint simply serve whatever was
         recorded while the setting is on (and 404 everything when off,
-        see router.verify_invoice)."""
+        see router.verify_invoice). Also stamps when the attempt began
+        (router._restorable) - a melt's payment hash is never reused (see
+        router.get_withdraw_callback), so the first stamp is the only one."""
         with self._lock, self.conn:
-            self.conn.execute("INSERT OR IGNORE INTO melts (payment_hash, pr) VALUES (?, ?)", (payment_hash, pr))
+            self.conn.execute(
+                "INSERT OR IGNORE INTO melts (payment_hash, pr, attempted_at) VALUES (?, ?, ?)",
+                (payment_hash, pr, int(time.time())),
+            )
+
+    def melt_attempted_at(self, payment_hash: str) -> int | None:
+        """When record_melt stamped this melt's attempt (0 for a row from
+        before that existed), or None if this mint never recorded one."""
+        row = self.conn.execute("SELECT attempted_at FROM melts WHERE payment_hash = ?", (payment_hash,)).fetchone()
+        return row[0] if row else None
 
     def melt_pr(self, payment_hash: str) -> str | None:
         """The invoice a melt paid into (LUD-25 verify's `pr` field), or

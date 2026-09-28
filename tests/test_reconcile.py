@@ -37,11 +37,17 @@ def test_reconcile_finalizes_a_pending_note_once_confirmed_paid(client: TestClie
     assert client.get(f"/w?k1={k1}").json()["status"] == "ERROR"
 
 
-def test_reconcile_restores_a_pending_note_once_confirmed_not_paid(client: TestClient, node: FakeNode, mint_note):
+def test_reconcile_restores_a_pending_note_once_confirmed_not_paid(
+    client: TestClient, node: FakeNode, mint_note, monkeypatch
+):
     k1 = _leave_a_note_pending(client, node, mint_note)
 
     node.is_payment_complete_raises = False
     node.payment_actually_completed = False
+    # its request went unanswered, so "not paid" restores it only once the
+    # grace period has passed (see test_poc_unanswered_melt_race.py) - as
+    # it has by the time a real leftover is reconciled at a later boot
+    monkeypatch.setattr(router_module, "_UNCONFIRMED_RESTORE_GRACE_SECONDS", 0)
     asyncio.run(router_module.reconcile_pending_melts(settings.funding_source()))
 
     assert client.get(f"/w?k1={k1}").json()["maxWithdrawable"] == 5000

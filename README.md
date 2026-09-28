@@ -87,6 +87,21 @@ response is sent before the payment is even attempted, a melt failure is never
 reported back through this callback - only observable as the note becoming
 spendable again.
 
+A melt whose payment request goes unanswered - our client times out or the
+connection drops, rather than the funding source refusing the payment - is
+not released on the funding source's first "no such payment": the request
+may still sit in the node's own queue (phoenixd's peer, cln's xpay still
+routing) and go out late, after the holder already melted the same value
+again. Such a note stays pending until the funding source either reports the
+payment (burned) or still reports none an hour after the attempt began
+(`router._UNCONFIRMED_RESTORE_GRACE_SECONDS`, counted from a time stored with
+the melt, so a restart doesn't reset it) - then it is released, with a
+warning naming the payment hash on stdout and in `error.log`. The grace
+period is a heuristic, not a proof: a funding source that stalls for longer
+while still answering lookups, then resumes, can still send the payment after
+the release - check it for a late payment when you see that warning. It runs
+on the wall clock, so a clock jumping forward shortens it.
+
 No spendable secret is ever persisted or, for a rotate/split/merge, even seen
 by this mint at all: notes are stored keyed by their output key `hex(Q)` -
 `p1`/`p2` above, or the mint `comment`, supplied by `WALLET` directly - and a
@@ -636,10 +651,19 @@ docstring):
 - **The mint never holds a mint-invoice's preimage**, as with spark:
   phoenixd picks it, and LUD-21 verify serves it only once settled
   (phoenixd itself reports it before payment, too).
-- **A melt payment phoenixd has no record of was never sent** - phoenixd
-  stores a payment before its HTLC leaves, like lnd and cln - so that note
-  restores; one still in flight (a hodl invoice) stays pending until
-  phoenixd reports an outcome.
+- **A melt payment phoenixd has no record of was never sent** once phoenixd
+  has acted on the request - it stores a payment before its HTLC leaves,
+  like lnd and cln - so that note restores; if the request itself went
+  unanswered, only after the grace period above (phoenixd queues it for its
+  peer first). Only phoenixd's own 400/401, or a request that never
+  reached it, count as refused; any other status - a reverse proxy's 504
+  included - waits out the grace period. One still in flight (a hodl
+  invoice) stays pending until phoenixd reports an outcome. Possible
+  hardening, not done: right before such a restore, a second
+  `/payinvoice` for the same invoice with `amountSat=0` would queue behind
+  the original and be refused without a record, proving the queue has
+  moved past it - left out so that `/payinvoice` only ever carries real
+  payments.
 - **Zaps work**: phoenixd sets description hashes.
 - **Every invoice carries `externalId=lnurlcash:<mintPubkey>`**, so a
   phoenixd shared with other applications can still list this mint's

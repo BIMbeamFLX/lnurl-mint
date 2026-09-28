@@ -459,7 +459,10 @@ def test_melt_rejects_invoice_of_wrong_amount(client: TestClient, node: FakeNode
 
 def test_failed_payment_restores_the_notes(client: TestClient, node: FakeNode, mint_note):
     k1 = mint_note(5000)
-    node.fail_payments = True
+    # a failure the funding source itself reports - one it never answered
+    # waits out router._UNCONFIRMED_RESTORE_GRACE_SECONDS first (see
+    # test_poc_unanswered_melt_race.py)
+    node.fail_reason = "Could not find a route to pay this invoice."
     pr = fake_invoice(5000)
     # per LUD-03 step 6, the callback replies OK immediately and pays
     # asynchronously - a payment failure is only ever observable via the
@@ -492,7 +495,7 @@ def test_pending_note_is_released_if_the_payment_fails(client: TestClient, node:
     k1 = mint_note(5000)
     pr = fake_invoice(5000)
     node.pay_delay = 0.3
-    node.fail_payments = True
+    node.fail_reason = "Could not find a route to pay this invoice."
 
     _, h = fresh_secret()
     thread = _melt_in_background(client, k1, pr, monkeypatch)
@@ -782,7 +785,7 @@ def test_failed_melt_restores_hash_lookup_value(client: TestClient, node: FakeNo
     k1 = mint_note(5000)
     note_id = k1_id(k1)
     node.pay_delay = 0.3
-    node.fail_payments = True
+    node.fail_reason = "Could not find a route to pay this invoice."
     thread = _melt_in_background(client, k1, fake_invoice(5000), monkeypatch)
     pending = client.get(f"/w?p={k1_hash(k1)}").json()
     thread.join()
