@@ -704,11 +704,32 @@ def test_fee_credit_stops_minting_but_not_the_health_check(phoenixd: FakePhoenix
     assert any("minting works again" in record.message for record in caplog.records)
 
 
-def test_fee_credit_is_measured_against_the_recorded_baseline(phoenixd: FakePhoenixd):
+class _Clock:
+    """Stands in for phoenixd.time: monotonic() moves only when told to."""
+
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def time(self) -> float:
+        return time.time()
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
+    fake = _Clock()
+    monkeypatch.setattr(phoenixd_module, "time", fake)
+    monkeypatch.setattr(phoenixd_module, "_lower_reading", None)
+    return fake
+
+
+def test_fee_credit_is_measured_against_the_recorded_baseline(phoenixd: FakePhoenixd, clock: _Clock):
     # a liquidity purchase leaves some credit behind for good - that much
     # must not stop minting, only credit gained since
     phoenixd.fee_credit_sat = 5
-    assert _run(phoenixd_module.record_fee_credit_baseline(CONFIG)) == 5
+    assert _run(phoenixd_module.record_fee_credit_baseline(CONFIG)) == (None, 5)
     assert db_module.notes.fee_credit_baseline() == 5
     assert _run(node_module.create_invoice(21_000, CONFIG))[0].startswith("lnbc")
 
@@ -716,9 +737,13 @@ def test_fee_credit_is_measured_against_the_recorded_baseline(phoenixd: FakePhoe
     with pytest.raises(ValueError, match="above its 5 sat baseline"):
         _run(node_module.create_invoice(21_000, CONFIG))
 
-    # credit that shrinks (a liquidity purchase) lowers the baseline with it,
-    # so growth from there on counts, even below the old baseline
+    # credit that shrinks (a liquidity purchase) lowers the baseline once the
+    # lower reading has held, so growth from there on counts, even below the
+    # old baseline
     phoenixd.fee_credit_sat = 3
+    assert _run(node_module.create_invoice(21_000, CONFIG))[0].startswith("lnbc")
+    assert db_module.notes.fee_credit_baseline() == 5  # not yet
+    clock.now += phoenixd_module._BASELINE_SETTLE_SECONDS
     assert _run(node_module.create_invoice(21_000, CONFIG))[0].startswith("lnbc")
     assert db_module.notes.fee_credit_baseline() == 3
     phoenixd.fee_credit_sat = 4
@@ -727,10 +752,61 @@ def test_fee_credit_is_measured_against_the_recorded_baseline(phoenixd: FakePhoe
     # the health check lowers it too, and never raises it
     phoenixd.fee_credit_sat = 1
     _run(node_module.fetch_node_info(CONFIG))
+    clock.now += phoenixd_module._BASELINE_SETTLE_SECONDS
+    _run(node_module.fetch_node_info(CONFIG))
     assert db_module.notes.fee_credit_baseline() == 1
     phoenixd.fee_credit_sat = 9
     _run(node_module.fetch_node_info(CONFIG))
     assert db_module.notes.fee_credit_baseline() == 1
+
+
+def test_phoenixds_zero_after_a_restart_does_not_pin_the_baseline(phoenixd: FakePhoenixd, clock: _Clock):
+    # right after a restart phoenixd reports no fee credit until its LSP's
+    # CurrentFeeCredit arrives - that transient 0 must not become the
+    # baseline, or minting would stay off once the real credit is back
+    phoenixd.fee_credit_sat = 5
+    _run(phoenixd_module.record_fee_credit_baseline(CONFIG))
+    phoenixd.fee_credit_sat = 0
+    assert _run(node_module.create_invoice(21_000, CONFIG))[0].startswith("lnbc")
+    clock.now += phoenixd_module._BASELINE_SETTLE_SECONDS - 1
+    phoenixd.fee_credit_sat = 5  # the LSP's figure arrives
+    assert _run(node_module.create_invoice(21_000, CONFIG))[0].startswith("lnbc")
+    clock.now += 10
+    assert _run(node_module.create_invoice(21_000, CONFIG))[0].startswith("lnbc")
+    assert db_module.notes.fee_credit_baseline() == 5
+
+
+def test_the_baseline_is_re_read_after_lowering(phoenixd: FakePhoenixd, clock: _Clock, monkeypatch: pytest.MonkeyPatch):
+    phoenixd.fee_credit_sat = 5
+    _run(phoenixd_module.record_fee_credit_baseline(CONFIG))
+    store = db_module.notes
+    lower = store.lower_fee_credit_baseline
+
+    def lowered_further_meanwhile(fee_credit_sat: int) -> None:
+        lower(fee_credit_sat)
+        lower(2)  # an interleaved call saw a smaller credit still
+
+    monkeypatch.setattr(store, "lower_fee_credit_baseline", lowered_further_meanwhile)
+    phoenixd.fee_credit_sat = 4
+    assert _run(node_module.create_invoice(21_000, CONFIG))[0].startswith("lnbc")  # 4 <= 5, not yet lowered
+    clock.now += phoenixd_module._BASELINE_SETTLE_SECONDS
+    with pytest.raises(ValueError, match="above its 2 sat baseline"):
+        _run(node_module.create_invoice(21_000, CONFIG))
+
+
+def test_a_read_only_password_cannot_mint(phoenixd: FakePhoenixd):
+    # every melt would meet the same 401 - so no deposits either, whether the
+    # health check found it first or create_invoice probes itself
+    with pytest.raises(ValueError, match="Minting is refused while melting cannot work"):
+        _run(node_module.create_invoice(21_000, LIMITED_CONFIG))
+    assert not any(call.path == "/createinvoice" for call in phoenixd.calls)
+    _run(node_module.fetch_node_info(LIMITED_CONFIG))
+    with pytest.raises(ValueError, match="reading only"):
+        _run(node_module.create_invoice(21_000, LIMITED_CONFIG))
+    assert not any(call.path == "/createinvoice" for call in phoenixd.calls)
+    # proven full access, cached from the health check, mints
+    _run(node_module.fetch_node_info(CONFIG))
+    assert _run(node_module.create_invoice(21_000, CONFIG))[0].startswith("lnbc")
 
 
 def test_the_stored_baseline_is_only_ever_lowered(tmp_path):
@@ -757,11 +833,57 @@ def test_the_baseline_command_records_the_fee_credit(
     phoenixd.fee_credit_sat = 1_234
     phoenixd_module.main(["record-fee-credit-baseline"])
     assert db_module.notes.fee_credit_baseline() == 1_234
-    assert "1234 sat" in capsys.readouterr().out
+    assert "1234 sat as the baseline (was: none)" in capsys.readouterr().out
+
+    # raising it needs --force - the credit gained since may back notes
+    phoenixd.fee_credit_sat = 1_300
+    with pytest.raises(SystemExit, match="1300 sat, above the recorded baseline of 1234 sat"):
+        phoenixd_module.main(["record-fee-credit-baseline"])
+    assert db_module.notes.fee_credit_baseline() == 1_234
+    phoenixd_module.main(["record-fee-credit-baseline", "--force"])
+    assert db_module.notes.fee_credit_baseline() == 1_300
+    assert "(was: 1234 sat)" in capsys.readouterr().out
+    # lowering it needs nothing
+    phoenixd.fee_credit_sat = 7
+    phoenixd_module.main(["record-fee-credit-baseline"])
+    assert db_module.notes.fee_credit_baseline() == 7
 
     monkeypatch.setattr(settings, "fundingsource_backend", "lnd")
     with pytest.raises(SystemExit, match="not phoenixd"):
         phoenixd_module.main(["record-fee-credit-baseline"])
+
+
+def _expired_invoice(amount_msat: int) -> str:
+    tags = Tags()
+    tags.add(TagChar.payment_hash, urandom(32).hex())
+    tags.add(TagChar.payment_secret, urandom(32).hex())
+    tags.add(TagChar.description, "test")
+    tags.add(TagChar.expire_time, 3600)
+    two_hours_ago = int(time.time()) - 7200
+    return bolt11.encode(
+        Bolt11(currency="bc", amount_msat=amount_msat, date=two_hours_ago, tags=tags), urandom(32).hex()
+    )
+
+
+def test_no_baseline_is_recorded_while_a_mint_invoice_can_still_be_paid(phoenixd: FakePhoenixd):
+    # a payment into fee credit after recording would pass for baseline
+    store = db_module.notes
+    expired = _expired_invoice(21_000)
+    store.create_mint(bolt11.decode(expired).payment_hash, expired, 21_000, urandom(32).hex())
+    phoenixd.fee_credit_sat = 3
+    assert _run(phoenixd_module.record_fee_credit_baseline(CONFIG)) == (None, 3)  # expired ones don't count
+
+    payable = fake_invoice(21_000)
+    store.create_mint(bolt11.decode(payable).payment_hash, payable, 21_000, urandom(32).hex())
+    with pytest.raises(ValueError, match="1 mint invoice"):
+        _run(phoenixd_module.record_fee_credit_baseline(CONFIG, force=True))
+    assert store.fee_credit_baseline() == 3
+
+
+def test_an_unreadable_mint_invoice_counts_as_still_payable(phoenixd: FakePhoenixd):
+    db_module.notes.create_mint(urandom(32).hex(), "not-an-invoice", 21_000, urandom(32).hex())
+    with pytest.raises(ValueError, match="1 mint invoice"):
+        _run(phoenixd_module.record_fee_credit_baseline(CONFIG))
 
 
 def test_an_unreadable_fee_credit_refuses_minting_and_only_warns_the_health_check(

@@ -590,11 +590,13 @@ The mint refuses to start unless all of this holds (see `config.py`):
 
 - **The full-access password.** phoenix.conf holds two, and melting calls
   `/payinvoice`, which `http-password-limited-access` cannot - the health
-  check warns about exactly that mistake. The password can spend the node's
-  whole balance, so the URL must be loopback; any other host needs
-  `https://` *and* `FUNDINGSOURCE_PHOENIXD_ALLOW_REMOTE=true`. It is never
-  logged, never taken from the URL, and requests ignore proxy/netrc
-  settings from the environment.
+  check warns about exactly that mistake, and minting stays off until the
+  password is proven (a mint that cannot pay melts must not take
+  deposits). The password can spend the node's whole balance, so the URL
+  must be loopback; any other host needs `https://` *and*
+  `FUNDINGSOURCE_PHOENIXD_ALLOW_REMOTE=true`. It is never logged, never
+  taken from the URL, and requests ignore proxy/netrc settings from the
+  environment.
 - **A signing key of the mint's own.** phoenixd has no signmessage, so
   LUD-25 certificates are signed locally with
   `FUNDINGSOURCE_PHOENIXD_SIGNING_KEY` - same digest and wire format as
@@ -638,15 +640,21 @@ none arrives short by a liquidity fee either). So:
    `python -m lnurl_mint.phoenixd record-fee-credit-baseline` (it stores
    `GET /getbalance`'s `feeCreditSat` in `DATABASE_PATH`). Some credit
    usually stays for good: a liquidity purchase only spends its actual
-   fee, while credit builds up to the worst case.
+   fee, while credit builds up to the worst case. The command refuses
+   while any mint invoice can still be paid, and to raise a baseline
+   already recorded without `--force` - it prints both values, and the
+   difference may back notes: only force it once you know no payment
+   landed in fee credit.
 4. To buy more inbound liquidity later, stop the mint and let its unpaid
    invoices expire (they are made to last an hour) before turning
    auto-liquidity back on; after step 2, record the baseline anew.
 
 As a backstop the mint refuses to create invoices while phoenixd's fee
-credit is above that baseline (above 0 if none was recorded); credit that
-shrinks lowers the baseline with it, so any later growth counts. The health
-check only warns about it: melts, and reconciling pending ones, carry on.
+credit is above that baseline (above 0 if none was recorded). Credit that
+shrinks lowers the baseline once the lower reading has held for five
+minutes - right after it restarts, phoenixd reports no fee credit at all
+until its LSP says otherwise - so any later growth counts. The health check
+only warns about it: melts, and reconciling pending ones, carry on.
 
 Behavioral differences worth knowing (details in `phoenixd.py`'s module
 docstring):

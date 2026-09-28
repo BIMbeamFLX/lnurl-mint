@@ -715,6 +715,15 @@ class NoteStore:
             self.conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('mint_pubkey', ?)", (pubkey,))
             return self.conn.execute("SELECT value FROM meta WHERE key = 'mint_pubkey'").fetchone()[0]
 
+    def unsettled_mint_invoices(self, since: int) -> list[tuple[str, str]]:
+        """(payment_hash, pr) of every mint invoice issued since `since` (unix
+        time) that has not settled into a note yet - unpaid, or paid but not
+        looked up so far."""
+        rows = self.conn.execute(
+            "SELECT payment_hash, pr FROM mints WHERE minted = 0 AND pr != '' AND created_at >= ?", (since,)
+        ).fetchall()
+        return [(row[0], row[1]) for row in rows]
+
     def fee_credit_baseline(self) -> int | None:
         """phoenixd's fee credit, in sat, as recorded once its auto-liquidity
         was switched off (see phoenixd._fee_credit_problem) - None if it

@@ -29,7 +29,9 @@ own default is http://127.0.0.1:9740) unless the operator both opts in
 (FUNDINGSOURCE_PHOENIXD_ALLOW_REMOTE) and uses https - see checked_url.
 It is never logged, never taken from the url itself, and requests ignore
 proxy and netrc settings from the environment (trust_env=False), so it
-only ever travels to the configured phoenixd.
+only ever travels to the configured phoenixd. Until the health check's
+probe has proven it is the full-access one, create_invoice refuses: a
+mint whose melts cannot be paid must not take deposits.
 
 Deviations from the lnd/cln backends worth knowing:
 
@@ -68,8 +70,10 @@ the baseline recorded at that switch (none recorded: any). Not against
 zero: a liquidity purchase only spends credit up to its actual fee, while
 credit builds up to the worst case (lightning-kmp InteractiveTx.kt,
 IncomingPaymentHandler.kt), so some is likely left over for good. Credit
-that shrinks lowers the baseline with it, so any later growth counts. The
-health check only warns about it - melts, and reconciling them, carry on.
+that shrinks lowers the baseline once the lower reading has held for five
+minutes (right after it restarts, phoenixd reports none at all until its
+LSP says otherwise), so any later growth counts. The health check only
+warns about it - melts, and reconciling them, carry on.
 
 **The melt fee is phoenixd's fixed rule, not a cap we pass.** /payinvoice
 takes no fee limit: every payment goes through ACINQ's trampoline, which
@@ -124,6 +128,7 @@ import ipaddress
 import json
 import logging
 import re
+import time
 from hashlib import sha256
 from typing import Any, Callable
 from urllib.parse import urlencode, urlparse
@@ -150,6 +155,9 @@ _MAX_DESCRIPTION_LENGTH = 128
 # (lightning-kmp's bolt11InvoiceExpiry), which is also how long an operator
 # would have to wait for old invoices to expire before a liquidity purchase
 _INVOICE_EXPIRY_SECONDS = 60 * 60
+# how far back the baseline command looks for mint invoices that may still
+# be payable - well past any expiry phoenixd gave one (its own default: a day)
+_PAYABLE_LOOKBACK_SECONDS = 7 * 24 * 60 * 60
 # every phoenixd answer is a small JSON document - anything bigger is not one
 _MAX_RESPONSE_BYTES = 1 << 20
 _TIMEOUT_SECONDS = 15.0
@@ -170,8 +178,16 @@ _FEE_RULE_CHECKED_VERSIONS = ((0, 5, 1), (0, 9, 1))
 # phoenixd versions (getinfo's "0.9.1-<commit>") already logged by this process
 _logged_versions: set[str] = set()
 # what the last health check found wrong, per part of the mint (see
-# _report_degraded) - so a problem is logged when it appears or changes
+# _report_degraded) - so a problem is logged when it appears or changes.
+# "melting" is also what create_invoice checks before it mints
 _degraded: dict[str, str | None] = {}
+# a fee credit reading below the baseline lowers it only once the same
+# reading has held this long: right after phoenixd restarts it reports no
+# fee credit at all until its LSP says otherwise (lightning-kmp starts
+# feeCreditFlow at 0), and pinning that transient 0 would keep minting off
+_BASELINE_SETTLE_SECONDS = 5 * 60
+# (reading, time.monotonic() when first seen) of a pending lower reading
+_lower_reading: tuple[int, float] | None = None
 
 
 def trampoline_fee_msat(amount_msat: int) -> int:
@@ -359,7 +375,9 @@ async def _fee_credit_problem(config: LightningBackendConfig) -> str | None:
     spend on its own liquidity fees, which a note minted for them would
     stand on - or None. Measured against the baseline recorded once
     auto-liquidity was switched off (see the module docstring), lowered to
-    any smaller credit seen since; with none recorded, against zero."""
+    any smaller credit that has held for _BASELINE_SETTLE_SECONDS; with none
+    recorded, against zero."""
+    global _lower_reading
     fee_credit_sat = await _fee_credit_sat(config)
     # imported here, not at the top: db needs config's settings, and
     # config's own validation is what first imports this module
@@ -367,8 +385,17 @@ async def _fee_credit_problem(config: LightningBackendConfig) -> str | None:
 
     baseline = notes.fee_credit_baseline()
     if baseline is not None and fee_credit_sat < baseline:
-        notes.lower_fee_credit_baseline(fee_credit_sat)
-        baseline = fee_credit_sat
+        now = time.monotonic()
+        if _lower_reading is None or _lower_reading[0] != fee_credit_sat:
+            _lower_reading = (fee_credit_sat, now)
+        elif now - _lower_reading[1] >= _BASELINE_SETTLE_SECONDS:
+            notes.lower_fee_credit_baseline(fee_credit_sat)
+            _lower_reading = None
+        # re-read rather than trust this reading: a concurrent call may have
+        # lowered it further in the meantime
+        baseline = notes.fee_credit_baseline()
+    else:
+        _lower_reading = None
     if fee_credit_sat <= (baseline if baseline is not None else 0):
         return None
     if baseline is None:
@@ -384,6 +411,29 @@ async def _fee_credit_problem(config: LightningBackendConfig) -> str | None:
     )
 
 
+async def _melting_problem(config: LightningBackendConfig) -> str | None:
+    """Why melting cannot work with this password, or None once proven.
+    getinfo answers the limited-access password too, but melting needs the
+    full-access one. An empty /payinvoice form tells them apart without
+    paying anything - phoenixd reads the invoice it requires before it
+    could ever pay: refused for that missing invoice (400) once past the
+    full-access check, with 401 before it. Only that 400 proves the
+    password."""
+    status, body = await _call(config, "POST", "/payinvoice", {})
+    if status == 401:
+        return (
+            "phoenixd accepts this password for reading only, so every melt is refused: "
+            "FUNDINGSOURCE_PHOENIXD_PASSWORD must be phoenix.conf's full-access http-password, "
+            "not http-password-limited-access."
+        )
+    if status != 400:
+        return (
+            f"phoenixd answered the password probe with {status}, not 400, so full access is unconfirmed: "
+            f"{_detail(body)}"
+        )
+    return None
+
+
 def _report_degraded(part: str, problem: str | None) -> None:
     """Logs a problem that leaves phoenixd reachable but one part of this
     mint unusable - when it appears or changes, and once when it clears,
@@ -396,15 +446,48 @@ def _report_degraded(part: str, problem: str | None) -> None:
         logging.info("phoenixd: %s works again.", part)
 
 
-async def record_fee_credit_baseline(config: LightningBackendConfig) -> int:
+async def record_fee_credit_baseline(config: LightningBackendConfig, force: bool = False) -> tuple[int | None, int]:
     """Records phoenixd's fee credit right now as the baseline minting is
-    measured against (see _fee_credit_problem), and returns it - the
-    operator's step once phoenixd runs with auto-liquidity=off."""
-    fee_credit_sat = await _fee_credit_sat(config)
+    measured against (see _fee_credit_problem) - the operator's step once
+    phoenixd runs with auto-liquidity=off - and returns (the old baseline,
+    the new one). Raises ValueError, recording nothing, while a mint
+    invoice can still be paid (fee credit it brought in after this would
+    pass for baseline), and on raising an existing baseline without
+    `force`: credit gained since may already back a note."""
     from .db import notes
 
+    now = int(time.time())
+    payable = [
+        payment_hash
+        for payment_hash, pr in notes.unsettled_mint_invoices(now - _PAYABLE_LOOKBACK_SECONDS)
+        if _still_payable(pr, now)
+    ]
+    if payable:
+        raise ValueError(
+            f"{len(payable)} mint invoice(s) can still be paid - stop the mint and wait until they have "
+            "expired (they last an hour) before recording the baseline."
+        )
+    fee_credit_sat = await _fee_credit_sat(config)
+    old = notes.fee_credit_baseline()
+    if old is not None and fee_credit_sat > old and not force:
+        raise ValueError(
+            f"phoenixd's fee credit is {fee_credit_sat} sat, above the recorded baseline of {old} sat: the "
+            f"{fee_credit_sat - old} sat gained since may back notes minted for payments that landed in fee "
+            "credit. Make sure none did, then rerun with --force to record it."
+        )
     notes.record_fee_credit_baseline(fee_credit_sat)
-    return fee_credit_sat
+    return old, fee_credit_sat
+
+
+def _still_payable(pr: str, now: int) -> bool:
+    """Whether the invoice `pr` has not expired as of `now` - an undecodable
+    one counts as payable, so the baseline command refuses rather than
+    guesses."""
+    try:
+        decoded = bolt11.decode(pr)
+    except Exception:
+        return True
+    return decoded.date + decoded.expiry > now
 
 
 def _log_version_once(version: Any) -> None:
@@ -454,6 +537,14 @@ async def _create_invoice_phoenixd(
         # invoice to a hash nobody's request has
         description_hash = sha256(description_for_hash.encode()).hexdigest()
         form["descriptionHash"] = description_hash
+    # a mint whose melts cannot be paid must not take deposits either: the
+    # health check's password probe must have proven full access (run here
+    # if no health check has yet)
+    if "melting" not in _degraded:
+        _report_degraded("melting", await _melting_problem(config))
+    melting_problem = _degraded["melting"]
+    if melting_problem is not None:
+        raise ValueError(f"Minting is refused while melting cannot work - {melting_problem}")
     # fails closed: an unreadable fee credit raises here, too
     problem = await _fee_credit_problem(config)
     if problem is not None:
@@ -648,29 +739,9 @@ async def _fetch_node_info_phoenixd(config: LightningBackendConfig) -> NodeInfo:
     # Past this point phoenixd is reachable, and this function returns: the
     # health check it serves also gates reconciling pending melts (see
     # server.py), which must go on whatever else is wrong - so the checks
-    # below only ever warn (_report_degraded), and each blocks just the
-    # part of the mint it concerns on its own.
-    #
-    # getinfo answers the limited-access password too, but melting needs the
-    # full-access one. An empty /payinvoice form tells them apart without
-    # paying anything - phoenixd reads the invoice it requires before it
-    # could ever pay: refused for that missing invoice (400) once past the
-    # full-access check, with 401 before it. Only that 400 proves the
-    # password (every melt meets the same 401 and is refused cleanly).
-    status, body = await _call(config, "POST", "/payinvoice", {})
-    melting_problem = None
-    if status == 401:
-        melting_problem = (
-            "phoenixd accepts this password for reading only, so every melt is refused: "
-            "FUNDINGSOURCE_PHOENIXD_PASSWORD must be phoenix.conf's full-access http-password, "
-            "not http-password-limited-access."
-        )
-    elif status != 400:
-        melting_problem = (
-            f"phoenixd answered the password probe with {status}, not 400, so full access is unconfirmed: "
-            f"{_detail(body)}"
-        )
-    _report_degraded("melting", melting_problem)
+    # below only ever warn (_report_degraded), and create_invoice blocks
+    # minting on either of them on its own.
+    _report_degraded("melting", await _melting_problem(config))
     try:
         minting_problem = await _fee_credit_problem(config)
     except Exception as exc:  # create_invoice meets the same error and refuses
@@ -703,12 +774,17 @@ def main(argv: list[str] | None = None) -> None:
 
     parser = argparse.ArgumentParser(prog="python -m lnurl_mint.phoenixd")
     parser.add_argument("command", choices=["record-fee-credit-baseline"])
-    parser.parse_args(argv)
+    parser.add_argument("--force", action="store_true", help="record a baseline above the one already recorded")
+    args = parser.parse_args(argv)
     config = settings.funding_source()
     if config.backend != "phoenixd":
         raise SystemExit("FUNDINGSOURCE_BACKEND is not phoenixd.")
-    fee_credit_sat = asyncio.run(record_fee_credit_baseline(config))
-    print(f"Recorded phoenixd's fee credit of {fee_credit_sat} sat as the baseline in {settings.database_path}.")
+    try:
+        old, new = asyncio.run(record_fee_credit_baseline(config, force=args.force))
+    except ValueError as exc:
+        raise SystemExit(f"Nothing recorded: {exc}") from exc
+    previous = "none" if old is None else f"{old} sat"
+    print(f"Recorded phoenixd's fee credit of {new} sat as the baseline (was: {previous}) in {settings.database_path}.")
 
 
 if __name__ == "__main__":
