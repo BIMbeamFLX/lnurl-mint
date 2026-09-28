@@ -70,10 +70,10 @@ the baseline recorded at that switch (none recorded: any). Not against
 zero: a liquidity purchase only spends credit up to its actual fee, while
 credit builds up to the worst case (lightning-kmp InteractiveTx.kt,
 IncomingPaymentHandler.kt), so some is likely left over for good. Credit
-that shrinks lowers the baseline once the lower reading has held for five
-minutes (right after it restarts, phoenixd reports none at all until its
-LSP says otherwise), so any later growth counts. The health check only
-warns about it - melts, and reconciling them, carry on.
+that shrinks lowers the baseline at once, so any later growth counts - to
+0 only once that has held for five minutes, since right after it restarts
+phoenixd reports none at all until its LSP says otherwise. The health
+check only warns about it - melts, and reconciling them, carry on.
 
 **The melt fee is phoenixd's fixed rule, not a cap we pass.** /payinvoice
 takes no fee limit: every payment goes through ACINQ's trampoline, which
@@ -181,13 +181,15 @@ _logged_versions: set[str] = set()
 # _report_degraded) - so a problem is logged when it appears or changes.
 # "melting" is also what create_invoice checks before it mints
 _degraded: dict[str, str | None] = {}
-# a fee credit reading below the baseline lowers it only once the same
-# reading has held this long: right after phoenixd restarts it reports no
-# fee credit at all until its LSP says otherwise (lightning-kmp starts
-# feeCreditFlow at 0), and pinning that transient 0 would keep minting off
+# a reading of no fee credit at all lowers the baseline only once it has
+# held this long: right after phoenixd restarts it reports 0 until its LSP
+# says otherwise (lightning-kmp starts feeCreditFlow at 0), and pinning that
+# transient 0 would keep minting off. Any other lower reading is real
+# (a liquidity purchase spent credit) and lowers it at once - waiting would
+# let fee credit gained meanwhile pass for the old, higher baseline
 _BASELINE_SETTLE_SECONDS = 5 * 60
-# (reading, time.monotonic() when first seen) of a pending lower reading
-_lower_reading: tuple[int, float] | None = None
+# time.monotonic() when a reading of 0 below the baseline was first seen
+_zero_reading_since: float | None = None
 
 
 def trampoline_fee_msat(amount_msat: int) -> int:
@@ -374,10 +376,10 @@ async def _fee_credit_problem(config: LightningBackendConfig) -> str | None:
     """Why minting must stop for phoenixd's fee credit - sats it can only
     spend on its own liquidity fees, which a note minted for them would
     stand on - or None. Measured against the baseline recorded once
-    auto-liquidity was switched off (see the module docstring), lowered to
-    any smaller credit that has held for _BASELINE_SETTLE_SECONDS; with none
-    recorded, against zero."""
-    global _lower_reading
+    auto-liquidity was switched off (see the module docstring), lowered at
+    once to any smaller credit - to 0 only once that has held for
+    _BASELINE_SETTLE_SECONDS; with none recorded, against zero."""
+    global _zero_reading_since
     fee_credit_sat = await _fee_credit_sat(config)
     # imported here, not at the top: db needs config's settings, and
     # config's own validation is what first imports this module
@@ -385,17 +387,19 @@ async def _fee_credit_problem(config: LightningBackendConfig) -> str | None:
 
     baseline = notes.fee_credit_baseline()
     if baseline is not None and fee_credit_sat < baseline:
-        now = time.monotonic()
-        if _lower_reading is None or _lower_reading[0] != fee_credit_sat:
-            _lower_reading = (fee_credit_sat, now)
-        elif now - _lower_reading[1] >= _BASELINE_SETTLE_SECONDS:
+        if fee_credit_sat > 0:
             notes.lower_fee_credit_baseline(fee_credit_sat)
-            _lower_reading = None
+            _zero_reading_since = None
+        elif _zero_reading_since is None:
+            _zero_reading_since = time.monotonic()
+        elif time.monotonic() - _zero_reading_since >= _BASELINE_SETTLE_SECONDS:
+            notes.lower_fee_credit_baseline(0)
+            _zero_reading_since = None
         # re-read rather than trust this reading: a concurrent call may have
         # lowered it further in the meantime
         baseline = notes.fee_credit_baseline()
     else:
-        _lower_reading = None
+        _zero_reading_since = None
     if fee_credit_sat <= (baseline if baseline is not None else 0):
         return None
     if baseline is None:

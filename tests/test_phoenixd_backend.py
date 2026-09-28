@@ -721,7 +721,7 @@ class _Clock:
 def clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
     fake = _Clock()
     monkeypatch.setattr(phoenixd_module, "time", fake)
-    monkeypatch.setattr(phoenixd_module, "_lower_reading", None)
+    monkeypatch.setattr(phoenixd_module, "_zero_reading_since", None)
     return fake
 
 
@@ -737,13 +737,9 @@ def test_fee_credit_is_measured_against_the_recorded_baseline(phoenixd: FakePhoe
     with pytest.raises(ValueError, match="above its 5 sat baseline"):
         _run(node_module.create_invoice(21_000, CONFIG))
 
-    # credit that shrinks (a liquidity purchase) lowers the baseline once the
-    # lower reading has held, so growth from there on counts, even below the
-    # old baseline
+    # credit that shrinks (a liquidity purchase) lowers the baseline at once,
+    # so growth from there on counts, even below the old baseline
     phoenixd.fee_credit_sat = 3
-    assert _run(node_module.create_invoice(21_000, CONFIG))[0].startswith("lnbc")
-    assert db_module.notes.fee_credit_baseline() == 5  # not yet
-    clock.now += phoenixd_module._BASELINE_SETTLE_SECONDS
     assert _run(node_module.create_invoice(21_000, CONFIG))[0].startswith("lnbc")
     assert db_module.notes.fee_credit_baseline() == 3
     phoenixd.fee_credit_sat = 4
@@ -752,12 +748,57 @@ def test_fee_credit_is_measured_against_the_recorded_baseline(phoenixd: FakePhoe
     # the health check lowers it too, and never raises it
     phoenixd.fee_credit_sat = 1
     _run(node_module.fetch_node_info(CONFIG))
-    clock.now += phoenixd_module._BASELINE_SETTLE_SECONDS
-    _run(node_module.fetch_node_info(CONFIG))
     assert db_module.notes.fee_credit_baseline() == 1
     phoenixd.fee_credit_sat = 9
     _run(node_module.fetch_node_info(CONFIG))
     assert db_module.notes.fee_credit_baseline() == 1
+
+
+def test_a_receipt_right_after_a_purchase_is_not_hidden(phoenixd: FakePhoenixd, clock: _Clock):
+    # the review's probe: a purchase drops the credit from 3000 to 1000, and a
+    # minute later a 1500 sat receipt makes it 2500 - still below the old
+    # baseline, but credit gained after the purchase all the same
+    phoenixd.fee_credit_sat = 3_000
+    _run(phoenixd_module.record_fee_credit_baseline(CONFIG))
+    phoenixd.fee_credit_sat = 1_000
+    _run(node_module.fetch_node_info(CONFIG))
+    clock.now += 60
+    phoenixd.fee_credit_sat = 2_500
+    with pytest.raises(ValueError, match="rose to 2500 sat, above its 1000 sat baseline"):
+        _run(node_module.create_invoice(21_000, CONFIG))
+
+
+def test_a_zero_reading_lowers_the_baseline_only_after_five_minutes(phoenixd: FakePhoenixd, clock: _Clock):
+    phoenixd.fee_credit_sat = 5
+    _run(phoenixd_module.record_fee_credit_baseline(CONFIG))
+    phoenixd.fee_credit_sat = 0
+    _run(node_module.fetch_node_info(CONFIG))
+    clock.now += 299
+    _run(node_module.fetch_node_info(CONFIG))
+    assert db_module.notes.fee_credit_baseline() == 5
+    clock.now += 1  # 300 s after the first 0
+    _run(node_module.fetch_node_info(CONFIG))
+    assert db_module.notes.fee_credit_baseline() == 0
+    assert phoenixd_module._BASELINE_SETTLE_SECONDS == 300
+
+
+def test_a_reading_back_at_the_baseline_restarts_the_zero_window(phoenixd: FakePhoenixd, clock: _Clock):
+    phoenixd.fee_credit_sat = 5
+    _run(phoenixd_module.record_fee_credit_baseline(CONFIG))
+    phoenixd.fee_credit_sat = 0
+    _run(node_module.fetch_node_info(CONFIG))  # a 0 from t=0
+    clock.now += 200
+    phoenixd.fee_credit_sat = 5  # back at the baseline: that 0 was a transient
+    _run(node_module.fetch_node_info(CONFIG))
+    clock.now += 99
+    phoenixd.fee_credit_sat = 0  # a new 0 from t=299
+    _run(node_module.fetch_node_info(CONFIG))
+    clock.now += 201  # 500 s after the first 0, 201 s after this one
+    _run(node_module.fetch_node_info(CONFIG))
+    assert db_module.notes.fee_credit_baseline() == 5
+    clock.now += 99  # 300 s after this 0
+    _run(node_module.fetch_node_info(CONFIG))
+    assert db_module.notes.fee_credit_baseline() == 0
 
 
 def test_phoenixds_zero_after_a_restart_does_not_pin_the_baseline(phoenixd: FakePhoenixd, clock: _Clock):
@@ -787,9 +828,7 @@ def test_the_baseline_is_re_read_after_lowering(phoenixd: FakePhoenixd, clock: _
         lower(2)  # an interleaved call saw a smaller credit still
 
     monkeypatch.setattr(store, "lower_fee_credit_baseline", lowered_further_meanwhile)
-    phoenixd.fee_credit_sat = 4
-    assert _run(node_module.create_invoice(21_000, CONFIG))[0].startswith("lnbc")  # 4 <= 5, not yet lowered
-    clock.now += phoenixd_module._BASELINE_SETTLE_SECONDS
+    phoenixd.fee_credit_sat = 4  # lowers to 4 - and meanwhile to 2
     with pytest.raises(ValueError, match="above its 2 sat baseline"):
         _run(node_module.create_invoice(21_000, CONFIG))
 
@@ -853,16 +892,52 @@ def test_the_baseline_command_records_the_fee_credit(
         phoenixd_module.main(["record-fee-credit-baseline"])
 
 
-def _expired_invoice(amount_msat: int) -> str:
+def _invoice_issued(amount_msat: int, seconds_ago: int, expiry: int) -> str:
+    """A signed invoice dated `seconds_ago`, valid for `expiry` seconds."""
     tags = Tags()
     tags.add(TagChar.payment_hash, urandom(32).hex())
     tags.add(TagChar.payment_secret, urandom(32).hex())
     tags.add(TagChar.description, "test")
-    tags.add(TagChar.expire_time, 3600)
-    two_hours_ago = int(time.time()) - 7200
-    return bolt11.encode(
-        Bolt11(currency="bc", amount_msat=amount_msat, date=two_hours_ago, tags=tags), urandom(32).hex()
-    )
+    tags.add(TagChar.expire_time, expiry)
+    issued = int(time.time()) - seconds_ago
+    return bolt11.encode(Bolt11(currency="bc", amount_msat=amount_msat, date=issued, tags=tags), urandom(32).hex())
+
+
+def _expired_invoice(amount_msat: int) -> str:
+    return _invoice_issued(amount_msat, seconds_ago=7200, expiry=3600)
+
+
+def _mint_row(invoice: str, seconds_ago: int = 0) -> str:
+    """Records `invoice` as a mint invoice issued `seconds_ago` - its payment hash."""
+    store = db_module.notes
+    payment_hash = bolt11.decode(invoice).payment_hash
+    store.create_mint(payment_hash, invoice, 21_000, urandom(32).hex())
+    with store.conn:
+        store.conn.execute(
+            "UPDATE mints SET created_at = ? WHERE payment_hash = ?", (int(time.time()) - seconds_ago, payment_hash)
+        )
+    return payment_hash
+
+
+def test_the_baseline_command_looks_back_seven_days(phoenixd: FakePhoenixd):
+    # phoenixd has only ever issued invoices valid for a day at most, so a
+    # week back covers every one that could still be paid - an invoice issued
+    # six days ago with a longer life still counts, one from eight days ago
+    # lies outside the window
+    day = 24 * 60 * 60
+    _mint_row(_invoice_issued(21_000, seconds_ago=8 * day, expiry=30 * day), seconds_ago=8 * day)
+    assert _run(phoenixd_module.record_fee_credit_baseline(CONFIG)) == (None, 0)
+    _mint_row(_invoice_issued(21_000, seconds_ago=6 * day, expiry=30 * day), seconds_ago=6 * day)
+    with pytest.raises(ValueError, match="1 mint invoice"):
+        _run(phoenixd_module.record_fee_credit_baseline(CONFIG))
+    assert phoenixd_module._PAYABLE_LOOKBACK_SECONDS == 7 * day
+
+
+def test_a_mint_invoice_already_settled_into_a_note_does_not_count(phoenixd: FakePhoenixd):
+    # still unexpired, but paid and minted - no later payment can land on it
+    payment_hash = _mint_row(fake_invoice(21_000))
+    assert db_module.notes.settle_mint(payment_hash) == 21_000
+    assert _run(phoenixd_module.record_fee_credit_baseline(CONFIG)) == (None, 0)
 
 
 def test_no_baseline_is_recorded_while_a_mint_invoice_can_still_be_paid(phoenixd: FakePhoenixd):

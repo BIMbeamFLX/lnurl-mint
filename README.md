@@ -651,9 +651,9 @@ none arrives short by a liquidity fee either). So:
 
 As a backstop the mint refuses to create invoices while phoenixd's fee
 credit is above that baseline (above 0 if none was recorded). Credit that
-shrinks lowers the baseline once the lower reading has held for five
-minutes - right after it restarts, phoenixd reports no fee credit at all
-until its LSP says otherwise - so any later growth counts. The health check
+shrinks lowers the baseline at once, so any later growth counts - to 0 only
+once that has held for five minutes, since right after it restarts phoenixd
+reports no fee credit at all until its LSP says otherwise. The health check
 only warns about it: melts, and reconciling pending ones, carry on.
 
 Behavioral differences worth knowing (details in `phoenixd.py`'s module
