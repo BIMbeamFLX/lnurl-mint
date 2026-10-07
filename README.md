@@ -147,6 +147,24 @@ source, both fields are simply omitted, same as any other unconfigured
 optional field, and signing failures (e.g. a briefly unreachable node) are
 swallowed rather than failing the rotate/split/merge itself.
 
+**Rotation certificates** (optional, same condition): a rotate - one `k1`, no
+`amount`, no `pr` - additionally carries `r`, a `cr1` certificate: the same
+kind of signature, by the same key, over
+`LNURLcash:rotate:<amount_msat>:<hex(Q_spent)>:<hex(Q)>` - the note this mint
+burned, the one note it credited in its place (`p1`), and that note's value,
+which the certificate's human-readable part carries like a `cs1`'s. A note's
+own `cs1` says the note exists; this says where it came from, and that
+nothing else came from the same note: a note is burned once, so no second
+certificate naming the same `Q_spent` can ever be issued. A split or a merge
+gets none - neither has one note that became one other. That is what an
+asset anchored to a note needs: lnurl-wallet's Seals hand a consignment from
+owner to owner, and with one `cr1` per transfer its holder can check offline
+that every step of the history really happened here, in that order, with no
+fork and no look-alike note minted on the side. Nothing is stored for it and
+nothing is looked up: the certificate goes to whoever made the rotation, and
+an exact retry of that request (LUD-25's Retrying a mutation) returns the
+same bytes again.
+
 **Notes and spends** ([LUD-25](../luds/25.md)): every note is a BIP-341
 taproot output key `Q`, and every `k1` is a spend of one, handed to Bitcoin
 Core's own interpreter ([lnurlcash-kernel](../lnurlcashkernel), see
@@ -165,6 +183,7 @@ values are bech32m (BIP-350):
   tapscript's upgrade hooks (an unknown leaf version, or any `OP_SUCCESSx`),
   which consensus would accept unconditionally and are refused instead.
 - **`cs1<sig>`** - this mint's issuance certificate, see Offline verification.
+- **`cr1<sig>`** - this mint's rotation certificate, see Rotation certificates.
 
 **Short forms**: a plain bearer note (BIP-341's NUMS key, one
 `OP_SHA256 <h> OP_EQUAL` leaf) is fully determined by `h`, so 64 hex

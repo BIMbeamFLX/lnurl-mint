@@ -39,7 +39,7 @@ from .node import (
     pay_invoice,
     payment_preimage,
 )
-from .signing import mint_pubkey, sign_note, verify_register_signature
+from .signing import mint_pubkey, sign_note, sign_rotation, verify_register_signature
 
 router = APIRouter()
 router.route_class = LnurlErrorResponseHandler
@@ -1167,6 +1167,18 @@ async def _certificate(note_id_hex: str, amount_msat: int, funding_source: Light
     return bech32m.encode_cs1(amount_msat, bytes.fromhex(raw))
 
 
+async def _rotation_certificate(
+    spent_id_hex: str, note_id_hex: str, amount_msat: int, funding_source: LightningBackendConfig
+) -> str | None:
+    """This mint's certificate for a rotation, `cr1<...>` over (Q_spent, Q,
+    amount): it burned the one note and credited exactly the other in its
+    place. None if signing isn't available right now (see sign_rotation)."""
+    raw = await sign_rotation(spent_id_hex, note_id_hex, amount_msat, funding_source)
+    if raw is None:
+        return None
+    return bech32m.encode_cr1(amount_msat, bytes.fromhex(raw))
+
+
 @router.get("/w", tags=["lnurlcash"], response_model=LnurlWithdrawResponse | LnurlErrorResponse)
 async def get_withdraw(
     req: Request,
@@ -1292,6 +1304,9 @@ async def get_withdraw_callback(
     - Every note minted here (never on melt) is signed per Offline
       verification, over the hash WALLET supplied - omitted if no funding
       source is configured or signing fails (see signing.sign_note).
+    - A rotate (one k1, no amount) additionally gets `r`, a `cr1` rotation
+      certificate over the burned note, `p1` and the amount (see
+      signing.sign_rotation) - a split or merge never does.
     - If any k1 is invalid the whole request fails atomically
       (NoteStore.swap); a k1 already reserved by another in-flight melt
       fails with reason "pending" instead (NoteStore.mark_pending).
@@ -1299,7 +1314,7 @@ async def get_withdraw_callback(
       that setting's own docstring in config.py.
     - LUD-25's Retrying a mutation: a rotate/split/merge whose k1(s), p1, p2
       and amount exactly match an earlier completed one gets that same
-      result replayed (c/c2 recomputed, deterministic per RFC6979)
+      result replayed (c/c2/r recomputed, deterministic per RFC6979)
       instead of "already spent" (see NoteStore.find_burn/swap). Melt is
       unaffected - LUD-25 only asks this of rotate/split/merge."""
     if len(k1) > settings.max_k1s:
@@ -1366,7 +1381,14 @@ async def get_withdraw_callback(
                     if recorded_p2 is not None and amount2_msat is not None
                     else None
                 )
-                return WithdrawSuccessResponse(c=sig, c2=sig2)
+                # only a rotate - one note in, one note out - has a rotation
+                # to certify, same condition as the live path below
+                rotation = (
+                    await _rotation_certificate(note_ids[0], recorded_p1, amount1_msat, funding_source)
+                    if len(note_ids) == 1 and recorded_p2 is None
+                    else None
+                )
+                return WithdrawSuccessResponse(c=sig, c2=sig2, r=rotation)
 
     if any(spent for _, _, spent, _ in verified):
         raise HTTPException(HTTPStatus.BAD_REQUEST, _INVALID_K1)
@@ -1490,7 +1512,16 @@ async def get_withdraw_callback(
         refund = (len(note_ids) - 1) * settings.base_fee_msat
         merged_amount = total_msat + refund
         notes.swap(note_ids, [p1_id], [merged_amount])
-        return WithdrawSuccessResponse(c=await _certificate(p1_id, merged_amount, settings.funding_source()))
+        funding_source = settings.funding_source()
+        return WithdrawSuccessResponse(
+            c=await _certificate(p1_id, merged_amount, funding_source),
+            # a merge has no single note to name as the one that became p1
+            r=(
+                await _rotation_certificate(note_ids[0], p1_id, merged_amount, funding_source)
+                if len(note_ids) == 1
+                else None
+            ),
+        )
     except OutputCollisionError as exc:
         raise HTTPException(HTTPStatus.BAD_REQUEST, str(exc))
     except PendingNoteError:

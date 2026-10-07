@@ -261,11 +261,12 @@ def test_withdraw_callback_signing_rpcs(client: TestClient, node: FakeNode, mint
         census.deltas()
         return k1
 
-    # rotate: 1 sign_message per request, never cached
+    # rotate: 2 sign_message per request, never cached - the new note's
+    # certificate, and the rotation's own (see signing.sign_rotation)
     k1 = minted_materialized_note(10_000)
     _, h = fresh_secret()
     assert client.get(f"/w/cb?k1={k1}&p1={h}").json()["status"] == "OK"
-    assert census.deltas() == {"sign_message": 1}
+    assert census.deltas() == {"sign_message": 2}
 
     # split: 2 sign_message per request (one per new note)
     k1 = minted_materialized_note(10_000)
@@ -274,7 +275,8 @@ def test_withdraw_callback_signing_rpcs(client: TestClient, node: FakeNode, mint
     assert client.get(f"/w/cb?k1={k1}&p1={h}&p2={h2}&amount=4000").json()["status"] == "OK"
     assert census.deltas() == {"sign_message": 2}
 
-    # merge: 1 sign_message per request (regardless of input count)
+    # merge: 1 sign_message per request (regardless of input count) - no
+    # rotation certificate, unlike a rotate
     k1a, k1b = minted_materialized_note(10_000), minted_materialized_note(10_000)
     _, h = fresh_secret()
     assert client.get(f"/w/cb?k1={k1a}&k1={k1b}&p1={h}").json()["status"] == "OK"
