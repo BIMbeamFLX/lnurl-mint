@@ -137,8 +137,9 @@ async def sign_rotation(
     one". What a holder cannot learn from a note's own `cs1`: that the note
     descends from one particular other note, and from nothing else - which
     is what an asset anchored to a note (lnurl-wallet's Seals) needs every
-    one of its transfers to prove. None if signing isn't possible right
-    now - never raises, same as sign_note."""
+    one of its transfers to prove. It is this key's statement about this
+    mint's own database, nothing more: the message names no mint. None if
+    signing isn't possible right now - never raises, same as sign_note."""
     if not config.backend:
         return None
     try:

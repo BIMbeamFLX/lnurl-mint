@@ -68,7 +68,7 @@ note and discloses only its `cp1<Q>` as `p1` (and, for a split's change note,
 short form (see "Notes and spends" below). This mint registers the new note
 under that Q directly and never sees, generates, or persists its spend - the
 callback response for these carries no secret at all, just `{"status": "OK"}` (plus
-`c`/`c2` if offline verification is configured, see below). `p1` is
+`c`/`c2`, and `r` for a rotate, if offline verification is configured, see below). `p1` is
 required whenever `pr` is absent; `p2` is additionally required whenever
 `amount` is too. A missing or malformed one fails with `{"status": "ERROR",
 "reason": "missing p1"}` (or `"missing p2"`) rather than this mint generating
@@ -153,17 +153,27 @@ kind of signature, by the same key, over
 `LNURLcash:rotate:<amount_msat>:<hex(Q_spent)>:<hex(Q)>` - the note this mint
 burned, the one note it credited in its place (`p1`), and that note's value,
 which the certificate's human-readable part carries like a `cs1`'s. A note's
-own `cs1` says the note exists; this says where it came from, and that
-nothing else came from the same note: a note is burned once, so no second
-certificate naming the same `Q_spent` can ever be issued. A split or a merge
-gets none - neither has one note that became one other. That is what an
-asset anchored to a note needs: lnurl-wallet's Seals hand a consignment from
-owner to owner, and with one `cr1` per transfer its holder can check offline
-that every step of the history really happened here, in that order, with no
-fork and no look-alike note minted on the side. Nothing is stored for it and
-nothing is looked up: the certificate goes to whoever made the rotation, and
-an exact retry of that request (LUD-25's Retrying a mutation) returns the
-same bytes again.
+own `cs1` says the note exists; this says where it came from. This mint burns
+a note once, so it signs at most one such statement for any `Q_spent`; a split
+or a merge gets none - neither has one note that became one other. That is
+what an asset anchored to a note needs: lnurl-wallet's Seals hand a
+consignment from owner to owner, and with one `cr1` per transfer its holder
+can check, against this mint's key alone, that every step of the history
+happened here, in that order, with no fork and no look-alike note minted on
+the side.
+
+The statement is the signing key's, and no stronger than this mint's own
+record of what it burned: two instances signing with one key, or a database
+restored from before a rotation, could each certify a different successor
+for the same note. Run one database per key. `cr1` is not part of LUD-25.
+
+There is no new table and no new endpoint. The certificate is computed from
+the request, and an exact retry of a completed rotate (LUD-25's Retrying a
+mutation, which reads the burn this mint already recorded) answers with it
+again - to anyone who can repeat that request, and with the same bytes
+whenever the funding source signs deterministically (RFC 6979). The two
+certificates of a rotate are signed side by side, so a rotate makes two
+signmessage calls where it made one, and waits for them once.
 
 **Notes and spends** ([LUD-25](../luds/25.md)): every note is a BIP-341
 taproot output key `Q`, and every `k1` is a spend of one, handed to Bitcoin
@@ -184,6 +194,7 @@ values are bech32m (BIP-350):
   which consensus would accept unconditionally and are refused instead.
 - **`cs1<sig>`** - this mint's issuance certificate, see Offline verification.
 - **`cr1<sig>`** - this mint's rotation certificate, see Rotation certificates.
+  Not one of LUD-25's own.
 
 **Short forms**: a plain bearer note (BIP-341's NUMS key, one
 `OP_SHA256 <h> OP_EQUAL` leaf) is fully determined by `h`, so 64 hex

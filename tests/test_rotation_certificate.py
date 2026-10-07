@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 from lnurl_mint import bech32m
 from lnurl_mint.config import settings
 from lnurl_mint.signing import lightning_signed_message_digest, verify_note, verify_rotation
-from tests.conftest import bearer_id, fresh_secret, k1_id
+from tests.conftest import bearer_id, ck1_for, fresh_secret, k1_id
 
 
 def _certifies_rotation(pubkey: str, spent_id: str, h: str, amount_msat: int, cr1: str) -> bool:
@@ -21,9 +21,11 @@ def _certifies_rotation(pubkey: str, spent_id: str, h: str, amount_msat: int, cr
 
 def test_cr1_test_vector():
     """A fixed vector other implementations can reproduce: the SERVICE key
-    is sha256("LNURLcash rotation certificate test vector"), the burned note
-    is pk_0 of 25.md's test vector 1 and the credited one pk_0 of its test
-    vector 2. Signed with RFC6979, like a node's signmessage."""
+    is sha256("LNURLcash rotation certificate test vector"). The two notes
+    are keys this suite's spec vectors already use: the burned one is the
+    pk_0 of test_ck1_matches_lud25_spec_test_vector_3, the credited one the
+    pk_0 of test_username_registration's registration-proof vector. Signed
+    with RFC6979, like a node's signmessage."""
     mint_pubkey = "0305299ebc7d5301da5ff64350c558d2daf9933445e611574474024d10d30f826a"
     spent = "aad3a0e36c083eb0d2d92ec0860977dc46d10c952f31830e6443b1faa1997634"
     note = "01fee34e378bf66de6afa1bfa6e30f5c89551fd92bc1b089dca93c52b7ab61bc"
@@ -66,6 +68,9 @@ def test_rotate_returns_a_valid_rotation_certificate(client: TestClient, mint_no
     data = client.get(f"/w/cb?k1={k1}&p1={h}").json()
     assert data["r"].startswith("cr50n1")
     assert _certifies_rotation(node.pubkey, k1_id(k1), h, 5000, data["r"])
+    # the amount the certificate carries is the amount it signs, and the
+    # same one the note's own certificate carries
+    assert bech32m.decode_cr1(data["r"])[0] == bech32m.decode_cs1(data["c"])[0] == 5000
 
 
 def test_rotation_certificates_chain_note_to_note(client: TestClient, mint_note, node):
@@ -131,6 +136,8 @@ def test_split_carries_no_rotation_certificate(client: TestClient, mint_note, no
     _, h2 = fresh_secret()
     data = client.get(f"/w/cb?k1={k1}&amount=2000&p1={h}&p2={h2}").json()
     assert data["status"] == "OK"
+    # signing works - both notes are certified - and still no rotation is
+    assert "c" in data and "c2" in data
     assert "r" not in data
 
 
@@ -139,6 +146,7 @@ def test_merge_carries_no_rotation_certificate(client: TestClient, mint_note, no
     _, h = fresh_secret()
     data = client.get(f"/w/cb?k1={a}&k1={b}&p1={h}").json()
     assert data["status"] == "OK"
+    assert "c" in data
     assert "r" not in data
 
 
@@ -177,6 +185,7 @@ def test_retried_split_and_merge_replay_without_a_rotation_certificate(client: T
     first = client.get(query).json()
     second = client.get(query).json()
     assert second == first
+    assert "c" in second
     assert "r" not in second
 
 
@@ -216,3 +225,121 @@ def test_rotation_signing_failure_is_swallowed_and_logged(client: TestClient, mi
     assert data == {"status": "OK"}
     assert any("sign_rotation" in r.message and "node unreachable" in r.message for r in caplog.records)
     assert client.get(f"/w?k1={new_k1}").json()["maxWithdrawable"] == 5000
+
+
+# ---- what must never be certified ----
+#
+# A rotation certificate says "this note became that one, and nothing else
+# did". Each test below asks for one that would not be true.
+
+
+def test_a_split_cannot_be_replayed_as_a_rotate(client: TestClient, mint_note, node):
+    # the note became TWO notes; naming it again with either of them alone
+    # is no retry of that split, and must not come back as "it became this"
+    k1 = mint_note(5000)
+    _, h = fresh_secret()
+    _, h2 = fresh_secret()
+    assert client.get(f"/w/cb?k1={k1}&amount=2000&p1={h}&p2={h2}").json()["status"] == "OK"
+    for output in (h, h2):
+        data = client.get(f"/w/cb?k1={k1}&p1={output}").json()
+        assert data["status"] == "ERROR"
+        assert "r" not in data
+    # the split itself still replays, without one
+    assert "r" not in client.get(f"/w/cb?k1={k1}&amount=2000&p1={h}&p2={h2}").json()
+
+
+def test_a_merge_cannot_be_replayed_as_a_rotate_of_one_of_its_notes(client: TestClient, mint_note, node):
+    a, b = mint_note(2000), mint_note(3000)
+    _, h = fresh_secret()
+    assert client.get(f"/w/cb?k1={a}&k1={b}&p1={h}").json()["status"] == "OK"
+    for k1 in (a, b):
+        data = client.get(f"/w/cb?k1={k1}&p1={h}").json()
+        assert data["status"] == "ERROR"
+        assert "r" not in data
+
+
+def test_a_note_is_certified_into_one_successor_only(client: TestClient, mint_note, node):
+    # the whole point: after "k1 became h", nothing can make this mint sign
+    # "k1 became other"
+    k1 = mint_note(5000)
+    _, h = fresh_secret()
+    _, other = fresh_secret()
+    first = client.get(f"/w/cb?k1={k1}&p1={h}").json()
+    assert _certifies_rotation(node.pubkey, k1_id(k1), h, 5000, first["r"])
+    data = client.get(f"/w/cb?k1={k1}&p1={other}").json()
+    assert data["status"] == "ERROR"
+    assert "r" not in data
+    # and the first answer is still the only one a retry gets
+    assert client.get(f"/w/cb?k1={k1}&p1={h}").json()["r"] == first["r"]
+
+
+def test_the_same_note_named_twice_is_no_rotate(client: TestClient, mint_note, node):
+    k1 = mint_note(5000)
+    _, h = fresh_secret()
+    data = client.get(f"/w/cb?k1={k1}&k1={k1}&p1={h}").json()
+    assert data["status"] == "ERROR"
+    assert "r" not in data
+    # nothing burned
+    assert client.get(f"/w?k1={k1}").json()["maxWithdrawable"] == 5000
+
+
+def test_concurrent_rotates_of_one_note_certify_one_successor(client: TestClient, mint_note, node):
+    from concurrent.futures import ThreadPoolExecutor
+
+    k1 = mint_note(5000)
+    outputs = [fresh_secret()[1] for _ in range(5)]
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        answers = list(pool.map(lambda h: client.get(f"/w/cb?k1={k1}&p1={h}").json(), outputs))
+    certified = [h for h, data in zip(outputs, answers) if "r" in data]
+    assert len(certified) == 1
+    assert [data["status"] for data in answers].count("OK") == 1
+
+
+# ---- every kind of note ----
+
+
+def test_a_key_path_note_is_certified_like_any_other(client: TestClient, mint_note, node):
+    # what a seal's note is spent by is a signature, not a preimage: the
+    # certificate names the notes by their Q either way
+    from tests.test_wallet_ownership_proofs import _mint_cp1_note, _note_keypair
+
+    sk, cp1 = _mint_cp1_note(client, node, 5000)
+    spent = bech32m.decode_cp1(cp1).hex()
+    next_sk, next_cp1 = _note_keypair()
+    note = bech32m.decode_cp1(next_cp1).hex()
+    data = client.get(f"/w/cb?k1={ck1_for(sk)}&p1={next_cp1}").json()
+    signature = bech32m.decode_cr1(data["r"])[1].hex()
+    assert verify_rotation(node.pubkey, spent, note, 5000, signature)
+    # and on from there
+    _, h = fresh_secret()
+    data = client.get(f"/w/cb?k1={ck1_for(next_sk)}&p1={h}").json()
+    assert _certifies_rotation(node.pubkey, note, h, 5000, data["r"])
+
+
+# ---- a certificate that went missing ----
+
+
+def test_a_rotation_certificate_lost_to_a_signing_failure_comes_back_on_retry(
+    client: TestClient, mint_note, node, monkeypatch
+):
+    # only the rotation's own signature fails: the rotate stands, the note
+    # is certified, and asking again - the same request - gets the rest
+    real_sign_message = node.sign_message
+
+    async def _rotation_signing_is_down(message, config):
+        if message.startswith("LNURLcash:rotate:"):
+            raise ConnectionError("node unreachable")
+        return await real_sign_message(message, config)
+
+    k1 = mint_note(5000)
+    assert client.get(f"/w?k1={k1}").json()["maxWithdrawable"] == 5000
+    _, h = fresh_secret()
+    monkeypatch.setattr("lnurl_mint.signing.sign_message", _rotation_signing_is_down)
+    first = client.get(f"/w/cb?k1={k1}&p1={h}").json()
+    assert first["status"] == "OK"
+    assert "c" in first and "r" not in first
+
+    monkeypatch.setattr("lnurl_mint.signing.sign_message", real_sign_message)
+    retried = client.get(f"/w/cb?k1={k1}&p1={h}").json()
+    assert retried["c"] == first["c"]
+    assert _certifies_rotation(node.pubkey, k1_id(k1), h, 5000, retried["r"])

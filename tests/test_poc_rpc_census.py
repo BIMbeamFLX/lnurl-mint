@@ -167,7 +167,7 @@ def test_withdraw_info_census(client: TestClient, node: FakeNode, mint_note, cen
     spent_k1 = mint_note(10_000)
     _, h = fresh_secret()
     assert client.get(f"/w/cb?k1={spent_k1}&p1={h}").json()["status"] == "OK"
-    census.deltas()  # discard the rotate's own sign_message
+    census.deltas()  # discard the rotate's own sign_message calls
     r = client.get(f"/w?k1={spent_k1}")
     assert r.json() == {"status": "ERROR", "reason": "Note already spent."}
     assert census.deltas() == {}
@@ -275,8 +275,9 @@ def test_withdraw_callback_signing_rpcs(client: TestClient, node: FakeNode, mint
     assert client.get(f"/w/cb?k1={k1}&p1={h}&p2={h2}&amount=4000").json()["status"] == "OK"
     assert census.deltas() == {"sign_message": 2}
 
-    # merge: 1 sign_message per request (regardless of input count) - no
-    # rotation certificate, unlike a rotate
+    # merge of two or more notes: 1 sign_message per request, however many
+    # go in - no rotation certificate, unlike a rotate (a "merge" of one
+    # note IS a rotate, and costs 2)
     k1a, k1b = minted_materialized_note(10_000), minted_materialized_note(10_000)
     _, h = fresh_secret()
     assert client.get(f"/w/cb?k1={k1a}&k1={k1b}&p1={h}").json()["status"] == "OK"
