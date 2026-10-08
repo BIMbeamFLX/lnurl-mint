@@ -62,6 +62,45 @@ def test_cr1_test_vector():
     assert not verify_note(mint_pubkey, spent, 1000, sig_1000)
 
 
+def test_what_a_cr1_says_that_a_cs1_cannot(client: TestClient, mint_note, node):
+    """The question a rotation certificate answers. A seal's history says
+    its note Q0 became Q1. Anyone who has seen that history can put a note
+    of their own on a made-up Q1': this mint certifies it like any note, and
+    Q0 really is spent. A buyer shown "Q0 became Q1'" has nothing to tell it
+    from the truth - every cs1 involved is genuine. Only the rotation itself
+    has a certificate, and this mint cannot issue a second one for Q0."""
+    from tests.test_wallet_ownership_proofs import _mint_cp1_note
+
+    # the real transfer: Q0 is burned into Q1
+    k1 = mint_note(5000)
+    q0 = k1_id(k1)
+    _, h = fresh_secret()
+    real = client.get(f"/w/cb?k1={k1}&p1={h}").json()
+    q1 = bearer_id(h)
+
+    # the look-alike: a fresh note, paid for by anyone, on a key they chose
+    _, cp1 = _mint_cp1_note(client, node, 5000)
+    q1_fake = bech32m.decode_cp1(cp1).hex()
+    fake = client.get(f"/w?p={cp1}").json()
+
+    # everything a cs1 can say is true of both: each note exists, each is
+    # worth 5000 - and Q0 is gone, whichever of the two one is shown
+    for note, cs1 in ((q1, real["c"]), (q1_fake, fake["c"])):
+        assert verify_note(node.pubkey, note, 5000, bech32m.decode_cs1(cs1)[1].hex())
+    assert client.get(f"/w?k1={k1}").json() == {"status": "ERROR", "reason": "Note already spent."}
+
+    # what tells them apart: this mint signed "Q0 became Q1" ...
+    rotation = bech32m.decode_cr1(real["r"])[1].hex()
+    assert verify_rotation(node.pubkey, q0, q1, 5000, rotation)
+    assert not verify_rotation(node.pubkey, q0, q1_fake, 5000, rotation)
+    # ... and nothing gets it to sign "Q0 became Q1'": not minting that note,
+    # not asking for the rotate again with it
+    assert "r" not in fake
+    again = client.get(f"/w/cb?k1={k1}&p1={cp1}").json()
+    assert again["status"] == "ERROR"
+    assert "r" not in again
+
+
 def test_rotate_returns_a_valid_rotation_certificate(client: TestClient, mint_note, node):
     k1 = mint_note(5000)
     _, h = fresh_secret()
